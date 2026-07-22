@@ -114,6 +114,17 @@ class CandidateTests(unittest.TestCase):
         self.assertTrue(all(item["num_wann"] <= 24 for item in candidates))
         self.assertEqual(candidates[0]["candidate"], "weight-80")
 
+        without_answer = suggest_projection_candidates(
+            {"In:s": 0.18, "In:p": 0.42, "Se:s": 0.03, "Se:p": 0.37},
+            {"In": 2, "Se": 2},
+            True,
+            chemical_valence=None,
+            max_num_wann=40,
+        )
+        p_only = next(item for item in without_answer if item["candidate"] == "p-only")
+        self.assertEqual(p_only["projection"], ["In:p", "Se:p"])
+        self.assertEqual(p_only["num_wann"], 24)
+
     def test_dataset_failure_label_required(self) -> None:
         record = make_attempt_record(
             material_id="local:BiTeI",

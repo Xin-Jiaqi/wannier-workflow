@@ -84,6 +84,8 @@ PYTHONPATH=src python3 -m w90flow.response_plan run RESPONSE_PLAN_DIR
 
 它硬性使用 `NOCC=nocc_model`，按响应类型→rank→结构串行，记录 MATLAB PID/日志和可恢复状态；不会将 `nocc_target` 误用为完整 hr 模型的占据数。详见 [RESPONSE_AUTOMATION.md](RESPONSE_AUTOMATION.md)。
 
+Wannier 拟合与非线性光学求和器保持为两个独立程序。核心交付的最小文件接口见 [NLO_HANDOFF.md](NLO_HANDOFF.md)；当前 Python shift-current/SHG 以后只需按该接口读取 top-K 包，不属于 W90Flow v1.0 的通过条件。
+
 下面的分步命令仍保留，用于调试和审计：
 
 ```bash
@@ -141,6 +143,7 @@ v1.0 的冻结范围、输入/输出、有限重试表和验收门槛见 [AUTOMA
 - 外窗每个 k 点至少 `NUM_WANN` 状态、冻结窗不超过 `NUM_WANN` 的硬约束；
 - 同一候选必须覆盖所有相关结构，按最差一侧门槛/误差排序；
 - 由目标能区积分轨道权重生成有限的覆盖率/化学完备候选分支，并按 SOC 自动计算 `NUM_WANN`；
+- 无人工价轨道答案时也自动保留通用 p-only、complete-sp 和 all-relevant 分支；重复投影会自动去重；
 - 三个现有实例作为回归测试。
 - 私有 POTCAR 拼接/哈希验证、SCF→Band CHGCAR 硬链接交接和显式执行保护；
 - 从真实 EIGENVAL+PROCAR 自动积分轨道权重；

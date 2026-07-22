@@ -67,6 +67,14 @@ def suggest_projection_candidates(
             if cumulative + 1e-12 >= target:
                 break
         raw.append((f"weight-{int(round(target * 100))}", selected, cumulative))
+    # Keep a generic p-shell-only branch whenever p character is present.  This
+    # is derived solely from the parsed PROCAR labels, not from a material-
+    # specific valence answer.  It provides a compact comparison model for
+    # common p-band semiconductors and is de-duplicated when weight-80 already
+    # selects the same projection.
+    p_shells = [label for label in ordered if label.split(":", 1)[1] == "p"]
+    if p_shells:
+        raw.append(("p-only", p_shells, sum(normalized.get(label, 0.0) for label in p_shells)))
     # Always retain a complete s/p shell candidate when p character is present.
     # This is important for optical-response completeness even if s weight in the
     # target window is small, and does not require a hand-written valence list.
@@ -82,12 +90,13 @@ def suggest_projection_candidates(
 
     priority = {
         "weight-80": 0,
-        "chemical-valence": 1,
-        "complete-sp": 2,
-        "weight-90": 3,
-        "weight-95": 4,
-        "expanded-valence": 5,
-        "all-relevant": 6,
+        "p-only": 1,
+        "chemical-valence": 2,
+        "complete-sp": 3,
+        "weight-90": 4,
+        "weight-95": 5,
+        "expanded-valence": 6,
+        "all-relevant": 7,
     }
     raw.sort(key=lambda item: (priority.get(item[0], 99), item[0]))
     results: list[dict[str, Any]] = []
