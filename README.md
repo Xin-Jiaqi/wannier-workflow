@@ -45,6 +45,18 @@ PYTHONPATH=src python3 -m w90flow init ../03_自动化架构/configs/pair-exampl
 
 ## 实际执行（v0.6）
 
+### 第一优先入口：从已有 SCF/Band 开始自动拟合
+
+现阶段最稳定的入口是不重复电子结构，而是导入输入哈希一致的 SCF/Band 目录后自动完成候选、有限 attempts、质量、排名和 top-K：
+
+```bash
+w90flow fit-from-bands /path/to/project.yaml --runs-root /path/to/private/runs \
+  --scf-source L1=/absolute/scf/L1 --band-source L1=/absolute/band/L1 \
+  --execute
+```
+
+多结构时为每个 structure id 各给一组 `--scf-source/--band-source`。Band 除 POSCAR、POTCAR、INCAR、KPOINTS 外还必须和 SCF 的 CHGCAR 哈希一致。默认 dry-run；执行后直接推进到无 POTCAR 的 top-K package。
+
 `prepare` 校验私有 POTCAR component/combined SHA256，建立不可覆盖 run，但不启动计算：
 
 ```bash
@@ -128,7 +140,7 @@ Wannier 拟合与非线性光学求和器保持为两个独立程序。核心交
 
 只要投影、`NUM_WANN`、排除带、能窗或收敛参数造成 INCAR 变化，命令就拒绝复用并要求真实拟合。
 
-当 SCF/Band 的 `POSCAR + POTCAR + INCAR + KPOINTS` 四个哈希完全一致时，可以零复制复用已完成阶段；任何一个输入不同都会拒绝：
+SCF 的 `POSCAR + POTCAR + INCAR + KPOINTS` 四个哈希完全一致时可以零复制复用；Band 还必须核验其 `CHGCAR`。任何一个输入不同都会拒绝：
 
 ```bash
 运行W90Flow.command import-stage RUN_DIR scf --source L1=/absolute/old/L1/scf --source L2=/absolute/old/L2/scf
@@ -154,7 +166,8 @@ v1.0 的冻结范围、输入/输出、有限重试表和验收门槛见 [AUTOMA
 - 外窗每个 k 点至少 `NUM_WANN` 状态、冻结窗不超过 `NUM_WANN` 的硬约束；
 - 同一候选必须覆盖所有相关结构，按最差一侧门槛/误差排序；
 - 由目标能区积分轨道权重生成有限的覆盖率/化学完备候选分支，并按 SOC 自动计算 `NUM_WANN`；
-- 无人工价轨道答案时也自动保留通用 p-only、complete-sp 和 all-relevant 分支；重复投影会自动去重；
+- 可选 `candidates.pyw90_dos.enabled: true` 将 PyW90 `pre dos` 投影作为带工具/输入哈希的第二候选来源；重复投影去重，所有建议仍必须经过相同真实拟合与硬质量门槛；
+- 无人工价轨道答案时，从 PROCAR 自动生成 s/p/d/f 单壳层和完备壳层组合；p-only/complete-sp 只是自然特例，重复投影自动去重；
 - 三个现有实例作为回归测试。
 - 私有 POTCAR 拼接/哈希验证、SCF→Band CHGCAR 硬链接交接和显式执行保护；
 - 从真实 EIGENVAL+PROCAR 自动积分轨道权重；
@@ -165,20 +178,29 @@ v1.0 的冻结范围、输入/输出、有限重试表和验收门槛见 [AUTOMA
 - 所有候选在同一目标能区判分，输出试算优先级/拟合排名/光学基组建议三张逻辑榜。
 - `common_basis` 从所有结构的 SCF/Band 能量和平均轨道特征共同规划同一 attempt/能窗；联合排名禁止混用不同重试参数，并按最差成员误差排序。
 - exact 判定的最小全局边界间隔可配置；InSe 以 0.05 eV 门槛强制进入真实解纠缠分支。
-- 已完成阶段可在四个科学输入哈希完全一致时用硬链接导入，避免重复 SCF/Band 和大型文件复制。
+- 已完成 SCF 可在四个科学输入哈希完全一致时导入；Band 还必须核验 CHGCAR，避免复用错误电荷密度。
 - MPI/沙箱等基础设施秒退与数值失败分开分类；仅前者允许同一 attempt 一次审计化重试。
+- 解纠缠重试是带编号的有限状态机：窗口尝试总数最多 4、局域化重试最多 3；失败只选择尚未执行的同类分支，不改变质量门槛。
 - C2DB 只读筛选保留来源 ID/路径、筛选字段和复核标记，不使用会重排 POSCAR 元素或删除旧目录的旧脚本逻辑。
 - 支持 `energy_reference: fermi_relative`：候选权重和能窗在统一的 `E-E_F` 坐标中规划，每个结构在写入 Wannier90 前自动转成绝对能量，并同时保存参考计划和物化后计划。
 - 新增单命令 `run/resume`、进程级 PID 断点、单 run 锁、有限分支选择和机器可读 `workflow-summary.json`。
 - 新增纯 Python `supervise`：阶段边界调度、可配置轮询/心跳、PID 恢复、无进展/超时告警、墙钟截止和信号安全 checkpoint。
 - 新增 top-K→MATLAB 响应计划层：自动传递 `nocc_model`、串行作业、PID/指纹断点和旧 MATLAB 活进程附着等待。
+- 新增 POSCAR 2D/3D 周期性审计、按倒空间间距生成均匀网格，以及可选 ASE 原生 band-path provider；VASPKIT 仍是待单独验证的可选 adapter，不是核心依赖。
+- 新增 `fit-from-bands` 单入口；请求 top-K 与实际通过数量都会显式写入排名/export，不会把不足数量伪装成完整 top-K。
 
 数据集与跨数据库 benchmark 的字段、切分和 ML 路线见 [DATASET_AND_BENCHMARK.md](DATASET_AND_BENCHMARK.md)。
 
 为了防止根据三个已知答案不断补特例，候选规则的开发集/冻结盲测集/外部盲测集和评分方式见 [GENERALIZATION_PROTOCOL.md](GENERALIZATION_PROTOCOL.md)。
 
-下一步只收敛 v1.0：端到端模拟/中断测试、PyW90 对照 adapter、BiTeI/InSe 输出回放和一次小型冷启动。生产网格与 top-K 下游 shift-current/SHG 在 v1.0 验收后再展开。
+下一步只收敛 v1.0：完成可执行 preprocess 状态机、对 PyW90 完整壳层与
+`px/py/pz` 分量建议做真实 attempt 回归，并完成 BiTeI/InSe/PtO2 的盲输入回放和
+一次全新材料冷启动。下游 shift-current/SHG 保持为独立私有模块，只消费 Stage-1
+通过硬门槛的 top-K 包。
 
 ## 科学边界
 
-能窗“合法”只表示状态数满足数学约束，不表示 Wannier 拟合已经优良。最终候选仍必须通过插值误差、带隙/连接性、spread/中心、Hermiticity、双结构共同基底，以及 shift current/SHG 稳定性检查。
+能窗“合法”只表示状态数满足数学约束，不表示 Wannier 拟合已经优良。最终候选仍
+必须通过插值误差、带隙/连接性、spread/中心、Hermiticity，以及（若请求）多结构
+共同基底检查。shift current/SHG 的 top-K 稳健性是下游物理分析，不反向改变本阶段
+的候选排名。

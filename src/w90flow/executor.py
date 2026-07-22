@@ -12,9 +12,16 @@ from typing import Any
 
 import yaml
 
-from .candidates import suggest_projection_candidates
+from .candidates import num_wann_from_projection, suggest_projection_candidates
 from .parsers import parse_eigenval, parse_fermi_outcar, parse_outcar_status, parse_poscar, parse_procar_orbital_scores, parse_wout
+from .pyw90_adapter import run_dos_suggest
 from .state import atomic_json, initialize_run, read_json, sha256_file, update_stage
+from .structure import (
+    generate_ase_band_path,
+    patch_wannier_band_path,
+    patch_wannier_uniform_grid,
+    render_gamma_kpoints,
+)
 
 
 VASP_STAGES = {
@@ -49,6 +56,17 @@ def _copy_exact(source: Path, target: Path) -> None:
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
+
+
+def _write_exact_text(target: Path, payload: str) -> None:
+    encoded = payload.encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    if target.exists():
+        if sha256_file(target) != digest:
+            raise FileExistsError(f"拒绝覆盖不同内容：{target}")
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(encoded)
 
 
 def _load_potcar_lock(config: dict[str, Any]) -> tuple[dict[str, Any], Path]:
@@ -106,7 +124,19 @@ def _read_snapshot(run_dir: Path) -> dict[str, Any]:
 
 
 def prepare_run(config: dict[str, Any], runs_root: str | Path) -> Path:
-    required_templates = {"scf": ("incar", "kpoints"), "band": ("incar", "kpoints"), "wannier": ("incar", "kpoints")}
+    band_path_mode = config.get("band_path", {}).get("mode", "template")
+    if band_path_mode in {"vaspkit", "both"}:
+        raise ValueError(
+            "VASPKIT provider 尚未冻结可审计的非交互任务接口；"
+            "请先使用 band_path.mode=template 或 native。"
+        )
+    all_have_scf_mesh = all(item.get("meshes_resolved", {}).get("scf") for item in config["structures"])
+    all_have_wannier_mesh = all(item.get("meshes_resolved", {}).get("wannier") for item in config["structures"])
+    required_templates = {
+        "scf": ("incar",) if all_have_scf_mesh else ("incar", "kpoints"),
+        "band": ("incar",) if band_path_mode == "native" else ("incar", "kpoints"),
+        "wannier": ("incar",) if all_have_wannier_mesh else ("incar", "kpoints"),
+    }
     for stage, roles in required_templates.items():
         for role in roles:
             if not config.get("templates", {}).get(stage, {}).get(f"{role}_resolved"):
@@ -127,16 +157,47 @@ def prepare_run(config: dict[str, Any], runs_root: str | Path) -> Path:
         base = run_dir / "structures" / sid
         _copy_exact(source_poscar, base / "00_input/POSCAR")
         links: dict[str, str] = {}
+        generated_inputs: dict[str, Any] = {}
+        band_path = None
+        if band_path_mode == "native":
+            band_path = generate_ase_band_path(
+                poscar_info,
+                list(structure["structure_analysis"]["periodic_axes"]),
+                int(config.get("band_path", {}).get("points_per_segment", 40)),
+            )
+            generated_inputs["band_path"] = {
+                key: value for key, value in band_path.items()
+                if key not in {"kpoints_text", "wannier_kpoint_path"}
+            }
         for short_stage, directory_name in VASP_STAGES.items():
             directory = base / directory_name
             _copy_exact(source_poscar, directory / "POSCAR")
             templates = config["templates"][short_stage]
-            _copy_exact(Path(templates["incar_resolved"]), directory / "INCAR")
-            _copy_exact(Path(templates["kpoints_resolved"]), directory / "KPOINTS")
+            incar_text = Path(templates["incar_resolved"]).read_text(encoding="utf-8", errors="replace")
+            if short_stage == "wannier":
+                wannier_mesh = structure.get("meshes_resolved", {}).get("wannier")
+                if wannier_mesh:
+                    incar_text = patch_wannier_uniform_grid(incar_text, wannier_mesh)
+                if band_path is not None:
+                    incar_text = patch_wannier_band_path(incar_text, band_path["wannier_kpoint_path"])
+            _write_exact_text(directory / "INCAR", incar_text)
+
+            resolved_mesh = structure.get("meshes_resolved", {}).get(short_stage)
+            if short_stage == "band" and band_path is not None:
+                _write_exact_text(directory / "KPOINTS", band_path["kpoints_text"])
+                generated_inputs["band_kpoints"] = "native_ase_path"
+            elif short_stage in {"scf", "wannier"} and resolved_mesh:
+                _write_exact_text(directory / "KPOINTS", render_gamma_kpoints(resolved_mesh))
+                generated_inputs[f"{short_stage}_mesh"] = resolved_mesh
+            else:
+                _copy_exact(Path(templates["kpoints_resolved"]), directory / "KPOINTS")
             links[directory_name] = _link_or_copy(private_potcar, directory / "POTCAR")
         manifests.append({
             "structure": sid,
             "poscar": poscar_info,
+            "structure_analysis": structure.get("structure_analysis"),
+            "meshes_resolved": structure.get("meshes_resolved", {}),
+            "generated_inputs": generated_inputs,
             "poscar_sha256": sha256_file(source_poscar),
             "potcar": potcar,
             "potcar_materialization": links,
@@ -336,7 +397,8 @@ def import_completed_stage(
     """Import a completed, input-identical SCF/Band stage without recomputation.
 
     Files are hard-linked when possible to save space. Exact hashes of POSCAR,
-    POTCAR, INCAR, and KPOINTS must match the prepared immutable run.
+    POTCAR, INCAR, and KPOINTS must match the prepared immutable run; Band also
+    verifies the SCF CHGCAR that fixes its charge-density input.
     """
     if stage not in {"scf", "band"}:
         raise ValueError("import-stage 当前只支持 scf 或 band。")
@@ -360,7 +422,8 @@ def import_completed_stage(
         if not source.is_dir():
             raise ValueError(f"导入源不是目录：{source}")
         input_hashes: dict[str, str] = {}
-        for name in ("POSCAR", "POTCAR", "INCAR", "KPOINTS"):
+        input_names = ("POSCAR", "POTCAR", "INCAR", "KPOINTS", "CHGCAR") if stage == "band" else ("POSCAR", "POTCAR", "INCAR", "KPOINTS")
+        for name in input_names:
             old = source / name
             new = target / name
             if not old.is_file() or not new.is_file():
@@ -395,7 +458,11 @@ def import_completed_stage(
         "stage": stage,
         "imported_utc": _utc_now(),
         "results": results,
-        "note": "Imported only after exact POSCAR/POTCAR/INCAR/KPOINTS hash equivalence.",
+        "note": (
+            "Imported only after exact POSCAR/POTCAR/INCAR/KPOINTS/CHGCAR hash equivalence."
+            if stage == "band" else
+            "Imported only after exact POSCAR/POTCAR/INCAR/KPOINTS hash equivalence."
+        ),
     }
     atomic_json(manifest_path, document)
     update_stage(root, stage_name, status="PASS", imported_utc=_utc_now(), outputs=results)
@@ -411,9 +478,20 @@ def generate_candidates(run_dir: str | Path) -> dict[str, Any]:
     mode = config.get("ensemble", {}).get("mode", "independent")
     chemical_valence = config.get("candidates", {}).get("chemical_valence")
     max_candidates = int(config.get("candidates", {}).get("max_candidates", 8))
+    shell_family_min_weight = float(config.get("candidates", {}).get("shell_family_min_weight", 0.08))
+    shell_combination_min_weight = float(config.get("candidates", {}).get("shell_combination_min_weight", 0.45))
     max_model_fraction = float(config.get("candidates", {}).get("max_num_wann_fraction_of_bands", 1.0))
     if not 0.0 < max_model_fraction <= 1.0:
         raise ValueError("candidates.max_num_wann_fraction_of_bands 必须在 (0, 1]。")
+    pyw90_config = config.get("candidates", {}).get("pyw90_dos", {})
+    if not isinstance(pyw90_config, dict):
+        raise ValueError("candidates.pyw90_dos 必须是对象。")
+    pyw90_enabled = bool(pyw90_config.get("enabled", False))
+    pyw90_required = bool(pyw90_config.get("required", False))
+    if pyw90_required and not pyw90_enabled:
+        raise ValueError("candidates.pyw90_dos.required=true 时 enabled 也必须为 true。")
+    pyw90_lower_bound = float(pyw90_config.get("lower_bound", 0.1))
+    pyw90_executable = str(pyw90_config.get("executable", "/private/tmp/LocalVASP-mount/bin/pyw90"))
     analyses: dict[str, Any] = {}
     element_counts_by_structure: dict[str, dict[str, int]] = {}
     for item in config["structures"]:
@@ -429,6 +507,48 @@ def generate_candidates(run_dir: str | Path) -> dict[str, Any]:
         if energy_reference == "fermi_relative":
             absolute_target = [target_min + fermi, target_max + fermi]
         scores = parse_procar_orbital_scores(band_dir / "PROCAR", poscar, *absolute_target)
+        pyw90_baseline: dict[str, Any] = {"enabled": pyw90_enabled, "status": "DISABLED"}
+        if pyw90_enabled:
+            output_json = root / "03_candidates" / f"pyw90-dos-{sid}.json"
+            try:
+                baseline = run_dos_suggest(
+                    band_dir / "vasprun.xml",
+                    target_energy_eV=(float(absolute_target[0]), float(absolute_target[1])),
+                    degeneracy=2 if soc else 1,
+                    lower_bound=pyw90_lower_bound,
+                    energy_reference="absolute",
+                    executable=pyw90_executable,
+                    output_json=output_json,
+                )
+                result = baseline["result"]
+                projection = list(result["projection"])
+                expected_num_wann = num_wann_from_projection(projection, element_counts, soc)
+                if int(result["num_wann_selected"]) != expected_num_wann:
+                    raise ValueError(
+                        "PyW90 num_wann 与 POSCAR 元素计数/SOC 简并不一致："
+                        f"{result['num_wann_selected']} != {expected_num_wann}"
+                    )
+                pyw90_baseline = {
+                    "enabled": True,
+                    "status": "PASS",
+                    "document": str(output_json),
+                    "source_sha256": baseline["source_sha256"],
+                    "tool_sha256": baseline["tool_sha256"],
+                    "projection": projection,
+                    "num_wann": expected_num_wann,
+                    "fermi_eV_reported": result.get("fermi_eV"),
+                    "dos_gap_eV": result.get("dos_gap_eV"),
+                    "lower_bound": pyw90_lower_bound,
+                }
+            except (OSError, RuntimeError, ValueError) as exc:
+                pyw90_baseline = {
+                    "enabled": True,
+                    "status": "FAILED",
+                    "error": str(exc),
+                    "required": pyw90_required,
+                }
+                if pyw90_required:
+                    raise ValueError(f"{sid} 的必需 PyW90 DOS baseline 失败：{exc}") from exc
         analyses[sid] = {
             "source": {"EIGENVAL": str(band_dir / "EIGENVAL"), "PROCAR": str(band_dir / "PROCAR")},
             "eigenval": {key: eig[key] for key in ("nelect", "nkpts", "nbands")},
@@ -436,7 +556,33 @@ def generate_candidates(run_dir: str | Path) -> dict[str, Any]:
             "target_energy_reference_eV": [target_min, target_max],
             "target_energy_absolute_eV": absolute_target,
             "projection_analysis": scores,
+            "pyw90_dos_baseline": pyw90_baseline,
         }
+
+    def pyw90_external(structure_ids: list[str]) -> list[dict[str, Any]]:
+        unique: list[tuple[str, list[str]]] = []
+        for sid in structure_ids:
+            baseline = analyses[sid]["pyw90_dos_baseline"]
+            projection = baseline.get("projection") if baseline.get("status") == "PASS" else None
+            if projection and list(projection) not in [item[1] for item in unique]:
+                unique.append((sid, list(projection)))
+        external = [
+            {
+                "candidate": "pyw90-dos" if len(unique) == 1 else f"pyw90-dos-{sid}",
+                "projection": projection,
+                "candidate_family": "external_baseline",
+            }
+            for sid, projection in unique
+        ]
+        if len(unique) > 1:
+            union = list(dict.fromkeys(label for _, projection in unique for label in projection))
+            if union not in [item[1] for item in unique]:
+                external.append({
+                    "candidate": "pyw90-dos-union",
+                    "projection": union,
+                    "candidate_family": "external_baseline",
+                })
+        return external
 
     if mode == "common_basis":
         counts_values = list(element_counts_by_structure.values())
@@ -453,8 +599,11 @@ def generate_candidates(run_dir: str | Path) -> dict[str, Any]:
             counts_values[0],
             soc,
             chemical_valence,
+            shell_family_min_weight=shell_family_min_weight,
+            shell_combination_min_weight=shell_combination_min_weight,
             max_num_wann=maximum_dimension,
             max_candidates=max_candidates,
+            external_candidates=pyw90_external(list(analyses)),
         )
         candidate_payload: dict[str, Any] = {"shared_candidates": shared, "combined_orbital_scores": combined}
     else:
@@ -465,8 +614,11 @@ def generate_candidates(run_dir: str | Path) -> dict[str, Any]:
                     element_counts_by_structure[sid],
                     soc,
                     chemical_valence,
+                    shell_family_min_weight=shell_family_min_weight,
+                    shell_combination_min_weight=shell_combination_min_weight,
                     max_num_wann=math.floor(analyses[sid]["eigenval"]["nbands"] * max_model_fraction),
                     max_candidates=max_candidates,
+                    external_candidates=pyw90_external([sid]),
                 )
                 for sid in analyses
             }
@@ -478,6 +630,19 @@ def generate_candidates(run_dir: str | Path) -> dict[str, Any]:
         "soc": soc,
         "energy_reference": energy_reference,
         "target_energy_eV": [target_min, target_max],
+        "candidate_policy": {
+            "max_candidates": max_candidates,
+            "max_num_wann_fraction_of_bands": max_model_fraction,
+            "shell_family_min_weight": shell_family_min_weight,
+            "shell_combination_min_weight": shell_combination_min_weight,
+            "chemical_valence_used": bool(chemical_valence),
+            "pyw90_dos": {
+                "enabled": pyw90_enabled,
+                "required": pyw90_required,
+                "lower_bound": pyw90_lower_bound,
+                "role": "optional_projection_baseline_not_authoritative_decision",
+            },
+        },
         "structures": analyses,
         **candidate_payload,
     }

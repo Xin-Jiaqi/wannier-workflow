@@ -11,7 +11,7 @@ from typing import Any
 import yaml
 
 from .attempts import create_attempts, recorded_or_classified_failure, run_attempt
-from .executor import generate_candidates, reconcile_stage, run_vasp_stage
+from .executor import generate_candidates, import_completed_stage, prepare_run, reconcile_stage, run_vasp_stage
 from .parsers import parse_wout
 from .quality import evaluate_attempt, export_ranked_attempts, rank_attempts
 from .state import atomic_json, read_json, read_status, update_stage
@@ -143,6 +143,48 @@ def inspect_workflow(run_dir: str | Path) -> dict[str, Any]:
     }
 
 
+def fit_from_precomputed(
+    config: dict[str, Any],
+    runs_root: str | Path,
+    scf_sources: dict[str, str | Path],
+    band_sources: dict[str, str | Path],
+    *,
+    execute: bool = False,
+    until: str = "export",
+) -> dict[str, Any]:
+    """Bootstrap the deterministic Wannier search from verified SCF/Band data."""
+    expected = {str(item["id"]) for item in config["structures"]}
+    if set(scf_sources) != expected or set(band_sources) != expected:
+        raise ValueError("SCF/Band source 映射必须恰好覆盖 project 中的全部结构。")
+    contract = {
+        "scf_required": ["POSCAR", "POTCAR", "INCAR", "KPOINTS", "OUTCAR", "OSZICAR", "CHGCAR", "EIGENVAL"],
+        "band_required": ["POSCAR", "POTCAR", "INCAR", "KPOINTS", "CHGCAR", "OUTCAR", "EIGENVAL", "PROCAR", "vasprun.xml"],
+        "hash_policy": "SCF verifies four prepared inputs; Band additionally verifies CHGCAR",
+        "next": "candidate generation -> finite Wannier attempts -> quality -> rank -> export",
+    }
+    if not execute:
+        return {
+            "mode": "DRY_RUN",
+            "project": config["project"],
+            "until": until,
+            "contract": contract,
+            "scf_sources": {key: str(value) for key, value in scf_sources.items()},
+            "band_sources": {key: str(value) for key, value in band_sources.items()},
+        }
+    run = prepare_run(config, runs_root)
+    scf_import = import_completed_stage(run, "scf", scf_sources)
+    band_import = import_completed_stage(run, "band", band_sources)
+    result = run_workflow(run, execute=True, until=until)
+    return {
+        "run_dir": str(run),
+        "contract": contract,
+        "scf_import": scf_import,
+        "band_import": band_import,
+        "workflow": result,
+        "passed": bool(result.get("passed")),
+    }
+
+
 def _attempt_complete(directory: Path) -> bool:
     required = ("wannier90.wout", "wannier90_hr.dat", "wannier90_centres.xyz", "wannier90_band.dat")
     if not all((directory / name).is_file() for name in required):
@@ -193,16 +235,48 @@ def _retry_reason(record: dict[str, Any]) -> str:
     return str(plan.get("retry_reason") or "seed")
 
 
-def choose_retry_reason(failures: list[str | None], attempted_reasons: set[str]) -> str | None:
+def _retry_class(record: dict[str, Any]) -> str:
+    plan = record.get("plan_reference", record.get("plan", {}))
+    if plan.get("mode") == "exact":
+        return "exact"
+    declared = plan.get("retry_class")
+    if declared:
+        return str(declared)
+    reason = str(plan.get("retry_reason") or "seed")
+    if reason.startswith("outer_window_expansion"):
+        return "outer_window_expansion"
+    if reason.startswith("convergence_retry"):
+        return "convergence_retry"
+    return reason
+
+
+def _retry_index(record: dict[str, Any]) -> int:
+    plan = record.get("plan_reference", record.get("plan", {}))
+    return int(plan.get("retry_index") or 0)
+
+
+def choose_retry_reason(
+    failures: list[str | None],
+    attempted_reasons: set[str],
+    available_classes: set[str] | None = None,
+) -> str | None:
     """Choose one finite deterministic branch; never relax quality thresholds."""
     clean = {failure for failure in failures if failure}
     if "NUMERIC_FAILURE" in clean:
         raise WorkflowBlocked("数值失败不能通过自动放宽科学参数处理。")
     if "INFRASTRUCTURE_FAILURE" in clean:
         return "same"
-    if clean & CONVERGENCE_FAILURES and "convergence_retry" not in attempted_reasons:
+    if clean & CONVERGENCE_FAILURES and (
+        "convergence_retry" in available_classes
+        if available_classes is not None
+        else "convergence_retry" not in attempted_reasons
+    ):
         return "convergence_retry"
-    if clean & WINDOW_FAILURES and "outer_window_expansion" not in attempted_reasons:
+    if clean & WINDOW_FAILURES and (
+        "outer_window_expansion" in available_classes
+        if available_classes is not None
+        else "outer_window_expansion" not in attempted_reasons
+    ):
         return "outer_window_expansion"
     return None
 
@@ -248,6 +322,9 @@ def _process_candidate(
             reason = _retry_reason(group[0])
             if any(_retry_reason(item) != reason for item in group):
                 raise WorkflowBlocked(f"{candidate}/{label} 在相关结构间使用了不同计划。")
+            retry_class = _retry_class(group[0])
+            if any(_retry_class(item) != retry_class for item in group):
+                raise WorkflowBlocked(f"{candidate}/{label} 在相关结构间使用了不同重试类别。")
             statuses = {str(item.get("status")) for item in group}
             if group_has_runnable_member(statuses):
                 ready[label] = group
@@ -275,11 +352,21 @@ def _process_candidate(
                     if retryable:
                         selected = last_label
                     else:
-                        desired = choose_retry_reason(previous_failures, attempted_reasons)
-                        selected = next((label for label, group in ready.items() if _retry_reason(group[0]) == desired), "")
+                        available = {_retry_class(group[0]) for group in ready.values()}
+                        desired = choose_retry_reason(previous_failures, attempted_reasons, available)
+                        selected = min(
+                            (label for label, group in ready.items() if _retry_class(group[0]) == desired),
+                            key=lambda label: (_retry_index(ready[label][0]), label),
+                            default="",
+                        )
                 else:
-                    desired = choose_retry_reason(previous_failures, attempted_reasons)
-                    selected = next((label for label, group in ready.items() if _retry_reason(group[0]) == desired), "")
+                    available = {_retry_class(group[0]) for group in ready.values()}
+                    desired = choose_retry_reason(previous_failures, attempted_reasons, available)
+                    selected = min(
+                        (label for label, group in ready.items() if _retry_class(group[0]) == desired),
+                        key=lambda label: (_retry_index(ready[label][0]), label),
+                        default="",
+                    )
             else:
                 selected = ""
             if not selected:

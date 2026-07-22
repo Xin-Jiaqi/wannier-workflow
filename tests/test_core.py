@@ -11,17 +11,18 @@ from unittest import mock
 
 from w90flow.config import load_project
 from w90flow.attempts import classify_failure, import_completed_attempt, materialize_plan_energy_reference, plan_candidate, recorded_or_classified_failure
-from w90flow.candidates import num_wann_from_projection, suggest_projection_candidates
+from w90flow.candidates import normalize_projection, num_wann_from_projection, suggest_projection_candidates
 from w90flow.dataset import make_attempt_record
 from w90flow.material_pool import screen_c2db
-from w90flow.orchestrator import RunLock, WorkflowBlocked, choose_retry_reason, group_has_runnable_member, inspect_workflow, run_workflow
+from w90flow.orchestrator import RunLock, WorkflowBlocked, choose_retry_reason, fit_from_precomputed, group_has_runnable_member, inspect_workflow, run_workflow
 from w90flow.parsers import parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_procar_orbital_scores
 from w90flow.quality import _best_contiguous_w90_slice, _common_attempt_ranking, _is_complete_sp, export_ranked_attempts
 from w90flow.pipeline import audit_reference, plan_project
-from w90flow.pyw90_adapter import parse_eig_suggest_output
+from w90flow.pyw90_adapter import parse_eig_suggest_output, parse_pre_dos_output
 from w90flow.ranking import Thresholds, audit_ranking_document, rank_common_candidates
 from w90flow.state import initialize_run, read_status, update_stage
 from w90flow.supervisor import ProgressWatch, SupervisorLock, inspect_supervisor, progress_fingerprint, supervise_workflow
+from w90flow.structure import generate_ase_band_path, patch_wannier_uniform_grid, resolve_periodicity, resolve_uniform_mesh
 from w90flow.windows import minimum_outer_max, validate_frozen_window, validate_outer_window, validate_window_containment
 
 
@@ -50,6 +51,41 @@ There are at most 4 states and at least 2 states in [-4.6, -0.5].
         self.assertEqual(parsed["outer_window_suggestions"][0]["nmost"], 4)
         self.assertEqual(parsed["frozen_window_suggestions"][0]["states"], 8)
 
+    def test_pyw90_pre_dos_projection_parser(self) -> None:
+        parsed = parse_pre_dos_output(
+            """\x1b[31mFermi level : -3.27340 eV\x1b[0m
+DOS Gap     : 1.31030 eV
+Number of WFs selected: 28 (with degeneracy 2)
+Wannier90 Projection:
+In:l=0;l=1
+Se:l=1
+
+pyw90 --extra input:
+In,0-1,0-3;Se,2-3,1-3
+"""
+        )
+        self.assertEqual(parsed["projection"], ["In:s", "In:p", "Se:p"])
+        self.assertEqual(parsed["num_wann_selected"], 28)
+        self.assertEqual(parsed["degeneracy"], 2)
+        self.assertAlmostEqual(parsed["dos_gap_eV"], 1.3103)
+
+    def test_pyw90_pre_dos_component_projection_parser(self) -> None:
+        parsed = parse_pre_dos_output(
+            """Number of WFs selected: 20 (with degeneracy 2)
+Wannier90 Projection:
+In:l=0;px;py
+Se:py;px
+
+pyw90 --extra input:
+In,0-1,0-1|3;Se,2-3,1|3
+"""
+        )
+        self.assertEqual(parsed["projection"], ["In:s", "In:px", "In:py", "Se:py", "Se:px"])
+        self.assertEqual(
+            num_wann_from_projection(parsed["projection"], {"In": 2, "Se": 2}, True),
+            20,
+        )
+
     def test_final_fermi_parser(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             outcar = Path(temporary) / "OUTCAR"
@@ -73,6 +109,63 @@ There are at most 4 states and at least 2 states in [-4.6, -0.5].
         scores = parse_procar_orbital_scores(example / "02_band/PROCAR", poscar, -4.6, -0.5)
         self.assertGreater(scores["selected_state_count"], 0)
         self.assertGreater(sum(value for key, value in scores["orbital_scores"].items() if key.endswith(":p")), 0.8)
+
+
+class StructureTests(unittest.TestCase):
+    def test_2d_and_3d_periodicity_and_mesh(self) -> None:
+        sheet = parse_poscar(FIXTURES / "project/POSCAR.L1")
+        two_d = resolve_periodicity(sheet, {"dimensionality": "auto"})
+        self.assertEqual(two_d["dimensionality"], 2)
+        self.assertEqual(two_d["periodic_axes"], [True, True, False])
+        mesh = resolve_uniform_mesh(
+            {"spacing_Ainv": 0.5, "maximum": 15},
+            sheet["lattice_angstrom"],
+            two_d["periodic_axes"],
+        )
+        self.assertEqual(mesh[2], 1)
+        self.assertGreater(mesh[0], 1)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            bulk_path = Path(temporary) / "POSCAR"
+            bulk_path.write_text(
+                "bulk\n1.0\n4 0 0\n0 4 0\n0 0 4\nX\n1\nDirect\n0 0 0\n",
+                encoding="utf-8",
+            )
+            bulk = parse_poscar(bulk_path)
+            three_d = resolve_periodicity(bulk, {"dimensionality": "auto"})
+            self.assertEqual(three_d["dimensionality"], 3)
+            self.assertEqual(three_d["periodic_axes"], [True, True, True])
+            self.assertTrue(all(value > 1 for value in resolve_uniform_mesh(
+                {"spacing_Ainv": 0.6}, bulk["lattice_angstrom"], three_d["periodic_axes"]
+            )))
+
+    def test_uniform_grid_patch_and_native_2d_path(self) -> None:
+        incar = 'LWANNIER90 = T\nWANNIER90_WIN = "\nmp_grid = 1 1 1\nbegin projections\nX:p\nend projections\n"\n'
+        patched = patch_wannier_uniform_grid(incar, [2, 2, 1])
+        self.assertIn("mp_grid = 2 2 1", patched)
+        self.assertEqual(patched.count("begin kpoints"), 1)
+        self.assertEqual(patched.count("end kpoints"), 1)
+        try:
+            path = generate_ase_band_path(
+                parse_poscar(FIXTURES / "project/POSCAR.L1"),
+                [True, True, False],
+                20,
+            )
+        except RuntimeError:
+            self.skipTest("ASE optional dependency is not installed")
+        self.assertTrue(path["segments"])
+        self.assertTrue(all(abs(float(value)) < 1e-12 for line in path["wannier_kpoint_path"] for value in [line.split()[-1]]))
+
+    def test_negative_poscar_scale_volume_is_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "POSCAR"
+            path.write_text(
+                "volume form\n-64\n1 0 0\n0 1 0\n0 0 1\nX\n1\nCartesian\n0.5 0.5 0.5\n",
+                encoding="utf-8",
+            )
+            parsed = parse_poscar(path)
+            self.assertAlmostEqual(parsed["lattice_angstrom"][0][0], 4.0)
+            self.assertEqual(parsed["fractional_positions"][0], [0.5, 0.5, 0.5])
 
 
 class WindowTests(unittest.TestCase):
@@ -99,6 +192,24 @@ class WindowTests(unittest.TestCase):
 
 
 class CandidateTests(unittest.TestCase):
+    def test_component_projection_dimension(self) -> None:
+        self.assertEqual(
+            num_wann_from_projection(
+                ["In:s", "In:px", "In:py", "Se:px", "Se:py"],
+                {"In": 2, "Se": 2},
+                True,
+            ),
+            20,
+        )
+        self.assertEqual(
+            normalize_projection(["In:p", "In:px", "In:py", "Se:px"]),
+            ["In:p", "Se:px"],
+        )
+        self.assertEqual(
+            num_wann_from_projection(["In:p", "In:px", "Se:px"], {"In": 2, "Se": 2}, True),
+            16,
+        )
+
     def test_soc_dimension_and_nested_candidates(self) -> None:
         counts = {"Bi": 1, "Te": 1, "I": 1}
         self.assertEqual(num_wann_from_projection(["Bi:p", "Te:p", "I:p"], counts, True), 18)
@@ -124,6 +235,91 @@ class CandidateTests(unittest.TestCase):
         p_only = next(item for item in without_answer if item["candidate"] == "p-only")
         self.assertEqual(p_only["projection"], ["In:p", "Se:p"])
         self.assertEqual(p_only["num_wann"], 24)
+
+    def test_dp_shell_family_is_generated_without_material_rules(self) -> None:
+        candidates = suggest_projection_candidates(
+            {"Pt:d": 0.44, "O:p": 0.41, "Pt:s": 0.08, "O:s": 0.07},
+            {"Pt": 1, "O": 2},
+            True,
+            max_num_wann=40,
+            max_candidates=8,
+        )
+        names = {item["candidate"] for item in candidates}
+        self.assertIn("d-only", names)
+        self.assertIn("p-only", names)
+        self.assertTrue(any(name.startswith("complete-") and "d" in name and "p" in name for name in names))
+
+    def test_external_projection_baseline_is_quality_gated_candidate_not_answer(self) -> None:
+        candidates = suggest_projection_candidates(
+            {"In:s": 0.24, "In:p": 0.24, "In:d": 0.05, "Se:s": 0.03, "Se:p": 0.44},
+            {"In": 2, "Se": 2},
+            True,
+            max_num_wann=40,
+            external_candidates=[{
+                "candidate": "pyw90-dos",
+                "projection": ["In:s", "Se:p"],
+                "candidate_family": "external_baseline",
+            }],
+        )
+        baseline = next(item for item in candidates if item["candidate"] == "pyw90-dos")
+        self.assertEqual(baseline["num_wann"], 16)
+        self.assertEqual(baseline["candidate_family"], "external_baseline")
+
+        components = suggest_projection_candidates(
+            {"In:s": 0.2, "In:p": 0.4, "Se:p": 0.4},
+            {"In": 2, "Se": 2},
+            True,
+            max_num_wann=40,
+            external_candidates=[{
+                "candidate": "pyw90-components",
+                "projection": ["In:s", "In:px", "In:py", "Se:px", "Se:py"],
+            }],
+        )
+        component = next(item for item in components if item["candidate"] == "pyw90-components")
+        self.assertEqual(component["num_wann"], 20)
+        self.assertEqual(component["integrated_weight_estimate"], "equal_component_split")
+        self.assertAlmostEqual(component["integrated_weight_fraction"], 11 / 15)
+
+    def test_iteration_budget_controls_disentanglement_plans(self) -> None:
+        energies = [[-2.0, -1.0, 0.0, 1.0], [-1.9, -0.8, 0.2, 1.2]]
+        features = [{"orbital_scores": {"X:p": 1.0}} for _ in range(4)]
+        candidate = {"projection": ["X:p"], "num_wann": 3}
+        plans = plan_candidate(
+            energies,
+            features,
+            candidate,
+            -1.1,
+            0.3,
+            isolation_threshold_eV=10.0,
+            max_window_attempts=1,
+            max_localization_retries=0,
+        )
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]["mode"], "disentanglement")
+
+        expanded = plan_candidate(
+            energies,
+            features,
+            candidate,
+            -1.1,
+            0.3,
+            isolation_threshold_eV=10.0,
+            max_window_attempts=3,
+            max_localization_retries=2,
+        )
+        self.assertEqual(len(expanded), 5)
+        self.assertEqual(
+            [plan.get("retry_reason", "seed") for plan in expanded],
+            [
+                "seed",
+                "outer_window_expansion_001",
+                "outer_window_expansion_002",
+                "convergence_retry_001",
+                "convergence_retry_002",
+            ],
+        )
+        self.assertEqual(expanded[2]["retry_class"], "outer_window_expansion")
+        self.assertEqual(expanded[4]["retry_class"], "convergence_retry")
 
     def test_dataset_failure_label_required(self) -> None:
         record = make_attempt_record(
@@ -310,6 +506,18 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(len(statuses), 8)
             self.assertTrue(all(item["status"] == "PENDING" for item in statuses))
 
+    def test_fit_from_bands_dry_run_is_single_entrypoint(self) -> None:
+        config = load_project(CONFIG)
+        result = fit_from_precomputed(
+            config,
+            "unused",
+            {"L1": "/scf/L1", "L2": "/scf/L2"},
+            {"L1": "/band/L1", "L2": "/band/L2"},
+            execute=False,
+        )
+        self.assertEqual(result["mode"], "DRY_RUN")
+        self.assertIn("CHGCAR", result["contract"]["band_required"])
+
     @unittest.skipUnless(HAS_REFERENCE_FIXTURES, "set W90FLOW_REFERENCE_ROOT for prepublication reference fixtures")
     def test_all_reference_examples(self) -> None:
         assert EXAMPLES is not None
@@ -367,6 +575,21 @@ class WorkflowTests(unittest.TestCase):
         )
         with self.assertRaises(WorkflowBlocked):
             choose_retry_reason(["NUMERIC_FAILURE"], set())
+        self.assertEqual(
+            choose_retry_reason(
+                ["LOCALIZATION_NOT_CONVERGED"],
+                {"seed", "convergence_retry_001"},
+                {"outer_window_expansion", "convergence_retry"},
+            ),
+            "convergence_retry",
+        )
+        self.assertIsNone(
+            choose_retry_reason(
+                ["LOCALIZATION_NOT_CONVERGED"],
+                {"seed", "convergence_retry_001", "convergence_retry_002"},
+                {"outer_window_expansion"},
+            )
+        )
 
     def test_common_attempt_resume_only_runs_missing_members(self) -> None:
         self.assertTrue(group_has_runnable_member({"ACCEPTED", "READY"}))

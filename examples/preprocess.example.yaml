@@ -1,0 +1,39 @@
+preprocess:
+  # A single true/false applies to every stage.  The mapping form below makes
+  # the common "nSOC relaxation, SOC electronic structure" choice explicit.
+  soc:
+    relaxation: false
+    scf: true
+    band: true
+
+  electronic:
+    ediff_eV: 1.0e-6
+    max_steps: 120
+
+  relaxation:
+    enabled: true
+    # For a 2D sheet this is the safe fixed-cell starting protocol.
+    cell_mode: ions_only
+    vacuum_axis: 2
+    force_threshold_eV_A: 0.01
+    max_steps: 200
+
+  band:
+    # Provider choice is frozen; the KPOINTS contents remain an immutable input.
+    path_provider: template
+
+# The loader/CLI adapter may pass this section to prepare_preprocess_run().
+# Paths are examples only; POTCAR bytes must remain in a licensed local registry.
+preprocess_inputs:
+  templates:
+    01_relax: {incar: templates/INCAR.relax, kpoints: templates/KPOINTS.relax}
+    02_scf: {incar: templates/INCAR.scf, kpoints: templates/KPOINTS.scf}
+    03_band: {incar: templates/INCAR.band, kpoints: templates/KPOINTS.band}
+  potcar:
+    path: /absolute/licensed/POTCAR
+    element_order: [In, Se]
+    sha256: "<required-64-hex>"
+  commands:
+    01_relax: [/absolute/run-vasp, "{stage_dir}", std]
+    02_scf: [/absolute/run-vasp, "{stage_dir}", ncl]
+    03_band: [/absolute/run-vasp, "{stage_dir}", ncl]

@@ -9,6 +9,9 @@ description = "Deterministic, AI-free POSCAR-to-Wannier workflow core"
 requires-python = ">=3.10"
 dependencies = ["PyYAML>=6", "matplotlib>=3.7"]
 
+[project.optional-dependencies]
+materials = ["ase>=3.22"]
+
 [project.scripts]
 w90flow = "w90flow.cli:main"
 

@@ -60,10 +60,17 @@ def _target_band_indices(energies: list[list[float]], target_min: float, target_
     if not energies:
         return []
     nbands = len(energies[0])
-    return [
+    touched = [
         band + 1 for band in range(nbands)
         if any(target_min <= row[band] <= target_max for row in energies)
     ]
+    if not touched:
+        return []
+    # Wannier eigenvalues are compared as a continuous sorted manifold.  If an
+    # intermediate DFT band never enters the numeric energy interval, skipping
+    # it would nevertheless map non-contiguous DFT indices onto a contiguous
+    # Wannier slice.  Protect the full band-index interval instead.
+    return list(range(min(touched), max(touched) + 1))
 
 
 def _boundary_gaps(energies: list[list[float]], start: int, stop: int) -> dict[str, float | None]:
@@ -75,7 +82,26 @@ def _boundary_gaps(energies: list[list[float]], start: int, stop: int) -> dict[s
 
 
 def _candidate_character(band_features: list[dict[str, Any]], projection: list[str]) -> list[float]:
-    return [sum(item["orbital_scores"].get(label, 0.0) for label in projection) for item in band_features]
+    component_shell = {
+        "px": "p", "py": "p", "pz": "p",
+        "dxy": "d", "dyz": "d", "dz2": "d", "dxz": "d", "dx2": "d", "dx2-y2": "d",
+    }
+
+    def score(item: dict[str, Any], label: str) -> float:
+        scores = item["orbital_scores"]
+        if label in scores:
+            return float(scores[label])
+        element, orbital = label.split(":", 1)
+        shell = component_shell.get(orbital)
+        if shell is None:
+            return 0.0
+        # PROCAR analysis currently records shell totals.  Split that total
+        # evenly only for band-selection heuristics; the real Wannier attempt
+        # and the hard band-quality gate remain authoritative.
+        divisor = 3 if shell == "p" else 5
+        return float(scores.get(f"{element}:{shell}", 0.0)) / divisor
+
+    return [sum(score(item, label) for label in projection) for item in band_features]
 
 
 def _exact_plan(
@@ -126,6 +152,8 @@ def _disentanglement_plans(
     target_indices: list[int],
     target_min: float,
     target_max: float,
+    max_window_attempts: int,
+    max_localization_retries: int,
 ) -> list[dict[str, Any]]:
     character = _candidate_character(band_features, projection)
     desired = set(target_indices)
@@ -167,9 +195,28 @@ def _disentanglement_plans(
         "dis_num_iter": 500,
         "dis_mix_ratio": 0.5,
     }
-    wider = {**seed, "dis_win_min_eV": round(raw_min - 0.5, 6), "dis_win_max_eV": round(outer_max + 0.5, 6), "retry_reason": "outer_window_expansion"}
-    localized = {**seed, "dis_num_iter": 1000, "dis_mix_ratio": 0.3, "num_iter": 5000, "retry_reason": "convergence_retry"}
-    return [seed, wider, localized]
+    plans = [seed]
+    for retry_index in range(1, max_window_attempts):
+        expansion = 0.5 * retry_index
+        plans.append({
+            **seed,
+            "dis_win_min_eV": round(raw_min - expansion, 6),
+            "dis_win_max_eV": round(outer_max + expansion, 6),
+            "retry_class": "outer_window_expansion",
+            "retry_index": retry_index,
+            "retry_reason": f"outer_window_expansion_{retry_index:03d}",
+        })
+    for retry_index in range(1, max_localization_retries + 1):
+        plans.append({
+            **seed,
+            "dis_num_iter": 500 * (retry_index + 1),
+            "dis_mix_ratio": round(max(0.1, 0.5 - 0.1 * retry_index), 3),
+            "num_iter": 5000 * retry_index,
+            "retry_class": "convergence_retry",
+            "retry_index": retry_index,
+            "retry_reason": f"convergence_retry_{retry_index:03d}",
+        })
+    return plans
 
 
 def plan_candidate(
@@ -179,7 +226,13 @@ def plan_candidate(
     target_min: float,
     target_max: float,
     isolation_threshold_eV: float = 0.02,
+    max_window_attempts: int = 2,
+    max_localization_retries: int = 1,
 ) -> list[dict[str, Any]]:
+    if not 1 <= max_window_attempts <= 4:
+        raise ValueError("有限状态机支持 1 到 4 个 window attempts。")
+    if not 0 <= max_localization_retries <= 3:
+        raise ValueError("有限状态机支持 0 到 3 个 localization retries。")
     target_indices = _target_band_indices(energies, target_min, target_max)
     exact = _exact_plan(
         energies,
@@ -199,6 +252,8 @@ def plan_candidate(
         target_indices,
         target_min,
         target_max,
+        max_window_attempts,
+        max_localization_retries,
     )
 
 
@@ -316,6 +371,13 @@ def create_attempts(run_dir: str | Path) -> dict[str, Any]:
     isolation_threshold = float(config.get("candidates", {}).get("exact_min_boundary_gap_eV", 0.05))
     if isolation_threshold <= 0:
         raise ValueError("candidates.exact_min_boundary_gap_eV 必须大于零。")
+    iteration = config.get("iteration", {})
+    max_window_attempts = int(iteration.get("max_window_attempts_per_candidate", 2))
+    max_localization_retries = int(iteration.get("max_localization_retries", 1))
+    if not 1 <= max_window_attempts <= 4:
+        raise ValueError("iteration.max_window_attempts_per_candidate 必须在 1 到 4 之间。")
+    if not 0 <= max_localization_retries <= 3:
+        raise ValueError("iteration.max_localization_retries 必须在 0 到 3 之间。")
     contexts: dict[str, dict[str, Any]] = {}
     for structure in config["structures"]:
         sid = str(structure["id"])
@@ -369,6 +431,8 @@ def create_attempts(run_dir: str | Path) -> dict[str, Any]:
                 target_min,
                 target_max,
                 isolation_threshold,
+                max_window_attempts,
+                max_localization_retries,
             )
     all_plans: dict[str, Any] = {}
     for structure in config["structures"]:
@@ -388,6 +452,8 @@ def create_attempts(run_dir: str | Path) -> dict[str, Any]:
                 target_min,
                 target_max,
                 isolation_threshold,
+                max_window_attempts,
+                max_localization_retries,
             )
             candidate_record = {"candidate": candidate, "attempts": []}
             if existing_projection == candidate["projection"] and (base / "05_quality/quality.json").is_file():
@@ -453,6 +519,10 @@ def create_attempts(run_dir: str | Path) -> dict[str, Any]:
         "ensemble_mode": mode,
         "energy_reference": energy_reference,
         "exact_min_boundary_gap_eV": isolation_threshold,
+        "iteration_budget": {
+            "max_window_attempts_per_candidate": max_window_attempts,
+            "max_localization_retries": max_localization_retries,
+        },
         "common_plan_across_structures": mode == "common_basis",
         "structures": all_plans,
         "failure_transitions": FAILURE_TRANSITIONS,

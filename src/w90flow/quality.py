@@ -461,6 +461,14 @@ def _is_complete_sp(projection: list[str]) -> bool:
     return bool(shells) and all({"s", "p"}.issubset(values) for values in shells.values())
 
 
+def _is_complete_shell_candidate(item: dict[str, Any]) -> bool:
+    return item.get("candidate_family") in {
+        "complete_shell_combination",
+        "all_observed_shells",
+        "explicit_optional_prior",
+    }
+
+
 def _fit_sort_key(item: dict[str, Any]) -> tuple[float, float, float, float, int]:
     metrics = item["metrics"]
     return (
@@ -538,6 +546,8 @@ def _common_attempt_ranking(
                     for sid, member in members.items()
                 },
                 "passed": True,
+                "candidate_family": next(iter(members.values())).get("candidate_family"),
+                "integrated_weight_fraction": next(iter(members.values())).get("integrated_weight_fraction"),
             })
         if not common_attempts:
             rejected.append({"candidate": candidate, "reason": "no_common_attempt_across_structures"})
@@ -551,6 +561,7 @@ def _common_attempt_ranking(
     for rank, item in enumerate(accepted, 1):
         item["rank"] = rank
         item["complete_sp_shells"] = _is_complete_sp(item["projection"])
+        item["complete_shell_candidate"] = _is_complete_shell_candidate(item)
     return {"ranking": accepted, "rejected": rejected}
 
 
@@ -569,6 +580,7 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
         sid = str(structure["id"])
         base = root / "structures" / sid
         candidates = spec["shared_candidates"] if spec["ensemble_mode"] == "common_basis" else spec["independent_candidates"][sid]
+        candidate_metadata = {str(item["candidate"]): item for item in candidates}
         priority = [{
             "priority": index,
             "candidate": item["candidate"],
@@ -581,6 +593,7 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
         baseline = base / "05_quality/quality.json"
         if baseline.is_file():
             raw = read_json(baseline)
+            metadata = candidate_metadata.get(str(raw["candidate"]), {})
             results.append({
                 "candidate": raw["candidate"],
                 "attempt": "baseline",
@@ -593,9 +606,12 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
                 "mean_spread_per_wf_ang2": None if raw.get("final_total_spread_ang2") is None else raw["final_total_spread_ang2"] / raw["num_wann"],
                 "passed": raw["passed"],
                 "quality": str(baseline),
+                "candidate_family": metadata.get("candidate_family", "legacy_baseline"),
+                "integrated_weight_fraction": metadata.get("integrated_weight_fraction"),
             })
         for quality_path in sorted((base / "04_wannier_attempts").glob("*/attempt-*/quality.json")):
             raw = read_json(quality_path)
+            metadata = candidate_metadata.get(str(raw["candidate"]), {})
             results.append({
                 "candidate": raw["candidate"],
                 "attempt": raw["attempt"],
@@ -608,27 +624,37 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
                 "mean_spread_per_wf_ang2": raw.get("mean_spread_per_wf_ang2"),
                 "passed": raw["passed"],
                 "quality": str(quality_path),
+                "candidate_family": metadata.get("candidate_family"),
+                "integrated_weight_fraction": metadata.get("integrated_weight_fraction"),
             })
         accepted = [item for item in results if item["passed"]]
         accepted.sort(key=_fit_sort_key)
         for rank, item in enumerate(accepted, 1):
             item["rank"] = rank
             item["complete_sp_shells"] = _is_complete_sp(item["projection"])
+            item["complete_shell_candidate"] = _is_complete_shell_candidate(item)
 
         optical = None
         if accepted:
             best = accepted[0]
-            practical = [item for item in accepted if item["complete_sp_shells"] and
+            practical = [item for item in accepted if item["complete_shell_candidate"] and
                          item["metrics"]["p95_mev"] <= best["metrics"]["p95_mev"] + 2.0 and
                          item["metrics"]["max_mev"] <= best["metrics"]["max_mev"] + 10.0]
-            selected = min(practical, key=lambda item: (item["num_wann"], item["rank"])) if practical else best
+            selected = min(
+                practical,
+                key=lambda item: (
+                    -float(item.get("integrated_weight_fraction") or 0.0),
+                    item["num_wann"],
+                    item["rank"],
+                ),
+            ) if practical else best
             optical = {
                 "candidate": selected["candidate"],
                 "fit_rank": selected["rank"],
                 "reason": (
-                    "complete_s_p_shells_within_practical_fit_tolerance"
-                    if selected["complete_sp_shells"] else
-                    "no_complete_sp_candidate_within_practical_fit_tolerance_use_best_fit_provisionally"
+                    "complete_observed_shell_family_within_practical_fit_tolerance"
+                    if selected["complete_shell_candidate"] else
+                    "no_complete_shell_family_within_practical_fit_tolerance_use_best_fit_provisionally"
                 ),
                 "requires_observable_convergence_check": True,
             }
@@ -637,6 +663,11 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
             "fit_ranking": accepted,
             "rejected": [item for item in results if not item["passed"]],
             "top_k": accepted[:output_top_k],
+            "top_k_status": {
+                "requested": output_top_k,
+                "available": len(accepted),
+                "complete": len(accepted) >= output_top_k,
+            },
             "optical_basis_recommendation": optical,
         }
         results_by_structure[sid] = results
@@ -648,30 +679,43 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
         best = joint["ranking"][0] if joint["ranking"] else None
         practical = [] if best is None else [
             item for item in joint["ranking"]
-            if item["complete_sp_shells"]
+            if item["complete_shell_candidate"]
             and item["pair_worst_metrics"]["p95_mev"] <= best["pair_worst_metrics"]["p95_mev"] + 2.0
             and item["pair_worst_metrics"]["max_mev"] <= best["pair_worst_metrics"]["max_mev"] + 10.0
         ]
         selected = None if best is None else (
-            min(practical, key=lambda item: (item["num_wann"], item["rank"])) if practical else best
+            min(
+                practical,
+                key=lambda item: (
+                    -float(item.get("integrated_weight_fraction") or 0.0),
+                    item["num_wann"],
+                    item["rank"],
+                ),
+            ) if practical else best
         )
         joint["optical_basis_recommendation"] = None if selected is None else {
             "candidate": selected["candidate"],
             "attempt": selected["attempt"],
             "fit_rank": selected["rank"],
             "reason": (
-                "complete_s_p_shells_within_practical_pair_worst_fit_tolerance"
-                if selected["complete_sp_shells"] else
-                "no_complete_sp_candidate_within_practical_pair_worst_fit_tolerance_use_best_fit_provisionally"
+                "complete_observed_shell_family_within_practical_pair_worst_fit_tolerance"
+                if selected["complete_shell_candidate"] else
+                "no_complete_shell_family_within_practical_pair_worst_fit_tolerance_use_best_fit_provisionally"
             ),
             "requires_observable_convergence_check": True,
         }
         joint["top_k"] = joint["ranking"][:output_top_k]
+        joint["top_k_status"] = {
+            "requested": output_top_k,
+            "available": len(joint["ranking"]),
+            "complete": len(joint["ranking"]) >= output_top_k,
+        }
     document = {
         "schema_version": 1,
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "ranking_scope": "same_declared_target_energy_window",
         "ensemble_mode": spec["ensemble_mode"],
+        "requested_top_k": output_top_k,
         "structures": structures,
         "joint_common_basis": joint,
         "interpretation": {
@@ -689,6 +733,7 @@ def export_ranked_attempts(run_dir: str | Path) -> dict[str, Any]:
     """Export small, POTCAR-free top-K packages for downstream optics."""
     root = Path(run_dir).expanduser().resolve()
     physics: dict[str, Any] = {}
+    structure_metadata: dict[str, Any] = {}
     snapshot = root / "project.snapshot.yaml"
     if snapshot.is_file():
         import yaml
@@ -700,6 +745,14 @@ def export_ranked_attempts(run_dir: str | Path) -> dict[str, Any]:
             for key in ("soc", "dimensionality", "axes", "energy_reference", "target_energy_eV"):
                 if key in source_physics:
                     physics[key] = source_physics[key]
+            structure_metadata = {
+                str(item["id"]): {
+                    "structure_analysis": item.get("structure_analysis"),
+                    "meshes_resolved": item.get("meshes_resolved", {}),
+                }
+                for item in project.get("structures", [])
+                if isinstance(item, dict) and item.get("id")
+            }
     ranking_path = root / "06_rank/candidate-ranking-v04.json"
     if not ranking_path.is_file():
         raise ValueError("请先运行 rank-attempts；缺少 candidate-ranking-v04.json。")
@@ -753,6 +806,18 @@ def export_ranked_attempts(run_dir: str | Path) -> dict[str, Any]:
         attempt = str(entry["attempt"])
         rank_root = item["rank_root"]
         rank_root.mkdir(parents=True, exist_ok=True)
+        package_physics = dict(physics)
+        member_analyses = [
+            structure_metadata.get(sid, {}).get("structure_analysis")
+            for sid in item["members"]
+        ]
+        member_analyses = [value for value in member_analyses if isinstance(value, dict)]
+        dimensions = {int(value["dimensionality"]) for value in member_analyses if "dimensionality" in value}
+        periodic_axes = {tuple(value["periodic_axes"]) for value in member_analyses if "periodic_axes" in value}
+        if len(dimensions) == 1:
+            package_physics["dimensionality"] = next(iter(dimensions))
+        if len(periodic_axes) == 1:
+            package_physics["periodic_axes"] = list(next(iter(periodic_axes)))
         package = {
             "rank": rank,
             "candidate": candidate,
@@ -760,7 +825,7 @@ def export_ranked_attempts(run_dir: str | Path) -> dict[str, Any]:
             "projection": entry["projection"],
             "num_wann": entry["num_wann"],
             "nocc_model": entry["nocc_model"],
-            "physics": physics,
+            "physics": package_physics,
             item["metric_key"]: item["metrics"],
             "structures": {},
         }
@@ -795,6 +860,7 @@ def export_ranked_attempts(run_dir: str | Path) -> dict[str, Any]:
             files = sorted(path for path in target.iterdir() if path.is_file())
             package["structures"][sid] = {
                 "metrics": member["metrics"],
+                **structure_metadata.get(sid, {}),
                 "files": {path.name: sha256_file(path) for path in files},
             }
         atomic_json(rank_root / "package-manifest.json", package)
@@ -803,6 +869,12 @@ def export_ranked_attempts(run_dir: str | Path) -> dict[str, Any]:
         "schema_version": 1,
         "ranking": str(ranking_path),
         "ensemble_mode": ensemble_mode,
+        "requested_top_k": ranking.get("requested_top_k"),
+        "top_k_status": (
+            ranking.get("joint_common_basis", {}).get("top_k_status")
+            if ensemble_mode == "common_basis" else
+            {sid: value.get("top_k_status") for sid, value in ranking.get("structures", {}).items()}
+        ),
         "packages": packages,
         "contains_potcar": False,
     }

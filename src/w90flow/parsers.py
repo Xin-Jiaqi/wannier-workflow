@@ -5,28 +5,101 @@ from pathlib import Path
 from typing import Any
 
 
+def _inverse_3x3(matrix: list[list[float]]) -> list[list[float]]:
+    a, b, c = matrix
+    det = (
+        a[0] * (b[1] * c[2] - b[2] * c[1])
+        - a[1] * (b[0] * c[2] - b[2] * c[0])
+        + a[2] * (b[0] * c[1] - b[1] * c[0])
+    )
+    if abs(det) < 1e-12:
+        raise ValueError("POSCAR 晶格矩阵不可逆。")
+    cofactors = [
+        [b[1] * c[2] - b[2] * c[1], -(b[0] * c[2] - b[2] * c[0]), b[0] * c[1] - b[1] * c[0]],
+        [-(a[1] * c[2] - a[2] * c[1]), a[0] * c[2] - a[2] * c[0], -(a[0] * c[1] - a[1] * c[0])],
+        [a[1] * b[2] - a[2] * b[1], -(a[0] * b[2] - a[2] * b[0]), a[0] * b[1] - a[1] * b[0]],
+    ]
+    return [[cofactors[j][i] / det for j in range(3)] for i in range(3)]
+
+
+def _determinant_3x3(matrix: list[list[float]]) -> float:
+    a, b, c = matrix
+    return (
+        a[0] * (b[1] * c[2] - b[2] * c[1])
+        - a[1] * (b[0] * c[2] - b[2] * c[0])
+        + a[2] * (b[0] * c[1] - b[1] * c[0])
+    )
+
+
+def _row_times_matrix(row: list[float], matrix: list[list[float]]) -> list[float]:
+    return [sum(row[index] * matrix[index][column] for index in range(3)) for column in range(3)]
+
+
 def parse_poscar(path: str | Path) -> dict[str, Any]:
     lines = [line.strip() for line in Path(path).read_text(encoding="utf-8", errors="replace").splitlines()]
     if len(lines) < 8:
         raise ValueError(f"POSCAR 太短：{path}")
-    scale = float(lines[1].split()[0])
-    if scale <= 0:
-        raise ValueError("当前自动化只支持正的 POSCAR scale；负值体积写法需先规范化。")
-    lattice = [[scale * float(value) for value in lines[index].split()[:3]] for index in (2, 3, 4)]
-    if any(len(vector) != 3 for vector in lattice):
+    scale_token = float(lines[1].split()[0])
+    if scale_token == 0:
+        raise ValueError("POSCAR scale 不能为零。")
+    raw_lattice = [[float(value) for value in lines[index].split()[:3]] for index in (2, 3, 4)]
+    if any(len(vector) != 3 for vector in raw_lattice):
         raise ValueError(f"POSCAR 晶格行格式错误：{path}")
+    if scale_token > 0:
+        scale_factor = scale_token
+    else:
+        raw_volume = abs(_determinant_3x3(raw_lattice))
+        if raw_volume < 1e-12:
+            raise ValueError("POSCAR 负 scale 体积写法的原始晶格体积为零。")
+        scale_factor = (abs(scale_token) / raw_volume) ** (1.0 / 3.0)
+    lattice = [[scale_factor * value for value in vector] for vector in raw_lattice]
     element_tokens = lines[5].split()
     if element_tokens and all(token.lstrip("+-").isdigit() for token in element_tokens):
         raise ValueError("VASP 4 风格 POSCAR 没有元素名，无法自动核对 POTCAR。")
     counts = [int(token) for token in lines[6].split()]
     if len(element_tokens) != len(counts) or any(count <= 0 for count in counts):
         raise ValueError(f"POSCAR 元素/原子数行不一致：{path}")
+    natoms = sum(counts)
+    cursor = 7
+    selective_dynamics = False
+    if cursor < len(lines) and lines[cursor].lower().startswith("s"):
+        selective_dynamics = True
+        cursor += 1
+    if cursor >= len(lines):
+        raise ValueError(f"POSCAR 缺少坐标模式：{path}")
+    mode_token = lines[cursor].lower()
+    cursor += 1
+    if mode_token.startswith("d"):
+        coordinate_mode = "direct"
+    elif mode_token.startswith("c") or mode_token.startswith("k"):
+        coordinate_mode = "cartesian"
+    else:
+        raise ValueError(f"POSCAR 坐标模式必须是 Direct/Cartesian：{path}")
+    if cursor + natoms > len(lines):
+        raise ValueError(f"POSCAR 原子坐标不足：{path}")
+    coordinates: list[list[float]] = []
+    for line in lines[cursor:cursor + natoms]:
+        parts = line.split()
+        if len(parts) < 3:
+            raise ValueError(f"POSCAR 原子坐标行格式错误：{path}")
+        coordinates.append([float(value) for value in parts[:3]])
+    if coordinate_mode == "direct":
+        fractional = [[value % 1.0 for value in row] for row in coordinates]
+    else:
+        inverse = _inverse_3x3(lattice)
+        fractional = [
+            [value % 1.0 for value in _row_times_matrix([scale_factor * value for value in row], inverse)]
+            for row in coordinates
+        ]
     return {
         "comment": lines[0],
         "elements": element_tokens,
         "counts": counts,
-        "natoms": sum(counts),
+        "natoms": natoms,
         "lattice_angstrom": lattice,
+        "coordinate_mode": coordinate_mode,
+        "selective_dynamics": selective_dynamics,
+        "fractional_positions": fractional,
     }
 
 
