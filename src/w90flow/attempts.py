@@ -234,6 +234,12 @@ def plan_candidate(
     if not 0 <= max_localization_retries <= 3:
         raise ValueError("有限状态机支持 0 到 3 个 localization retries。")
     target_indices = _target_band_indices(energies, target_min, target_max)
+    # A Wannier Hamiltonian with fewer eigenvalues than the protected DFT band
+    # manifold can never reproduce that manifold.  Reject it before launching
+    # VASP/Wannier instead of spending a numerical attempt on an impossible
+    # quality comparison.
+    if len(target_indices) > int(candidate["num_wann"]):
+        return []
     exact = _exact_plan(
         energies,
         band_features,

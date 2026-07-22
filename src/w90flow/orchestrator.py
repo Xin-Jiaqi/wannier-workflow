@@ -15,7 +15,7 @@ from .attempts import create_attempts, recorded_or_classified_failure, run_attem
 from .executor import generate_candidates, import_completed_stage, prepare_run, reconcile_stage, run_vasp_stage
 from .parsers import parse_poscar, parse_wout
 from .structure import resolve_periodicity, resolve_uniform_mesh
-from .quality import evaluate_attempt, export_ranked_attempts, rank_attempts
+from .quality import IncompleteTargetSubspace, evaluate_attempt, export_ranked_attempts, rank_attempts
 from .state import atomic_json, read_json, read_status, sha256_file, update_stage
 
 
@@ -404,7 +404,30 @@ def _evaluate_pass_records(root: Path, structures: list[str], candidate: str, at
     for sid in structures:
         directory, record = _attempt_records(root, sid, candidate)[attempt]
         if record.get("status") == "PASS":
-            evaluate_attempt(root, sid, candidate, attempt)
+            try:
+                evaluate_attempt(root, sid, candidate, attempt)
+            except IncompleteTargetSubspace as exc:
+                rejection = {
+                    "schema_version": 1,
+                    "passed": False,
+                    "structure": sid,
+                    "candidate": candidate,
+                    "attempt": attempt,
+                    "failure_class": "INCOMPLETE_TARGET_SUBSPACE",
+                    "target_band_count": exc.target_band_count,
+                    "model_dimension": exc.model_dimension,
+                    "reason": str(exc),
+                    "quality_gate": "model_dimension_must_cover_protected_target_manifold",
+                }
+                quality_path = directory / "quality.json"
+                atomic_json(quality_path, rejection)
+                record.update({
+                    "status": "REJECTED_QUALITY",
+                    "quality_evaluated_utc": _utc_now(),
+                    "quality": str(quality_path),
+                    "failure_class": "INCOMPLETE_TARGET_SUBSPACE",
+                })
+                atomic_json(directory / "attempt.json", record)
 
 
 def _common_attempt_passed(root: Path, structures: list[str], candidate: str, attempt: str) -> bool:

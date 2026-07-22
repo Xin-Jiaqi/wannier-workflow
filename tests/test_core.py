@@ -342,6 +342,15 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(expanded[2]["retry_class"], "outer_window_expansion")
         self.assertEqual(expanded[4]["retry_class"], "convergence_retry")
 
+    def test_candidate_smaller_than_target_manifold_is_rejected_before_vasp(self) -> None:
+        energies = [
+            [-5.0, -3.0, -2.0, -1.0, 0.0, 2.0],
+            [-4.9, -2.9, -1.9, -0.9, 0.1, 2.1],
+        ]
+        features = [{"orbital_scores": {"X:s": 1.0}} for _ in range(6)]
+        candidate = {"projection": ["X:s"], "num_wann": 3}
+        self.assertEqual(plan_candidate(energies, features, candidate, -3.2, 0.2), [])
+
     def test_dataset_failure_label_required(self) -> None:
         record = make_attempt_record(
             material_id="local:BiTeI",

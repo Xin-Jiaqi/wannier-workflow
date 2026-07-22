@@ -13,6 +13,18 @@ from .parsers import count_wannier_centres, parse_eigenval, parse_fermi_outcar, 
 from .state import atomic_json, read_json, sha256_file, update_stage
 
 
+class IncompleteTargetSubspace(ValueError):
+    """The Wannier model is too small to represent the protected DFT manifold."""
+
+    def __init__(self, target_band_count: int, model_dimension: int):
+        self.target_band_count = target_band_count
+        self.model_dimension = model_dimension
+        super().__init__(
+            "目标 DFT 能带数大于 Wannier 模型维数："
+            f"{target_band_count} > {model_dimension}。"
+        )
+
+
 def _cross(a: list[float], b: list[float]) -> list[float]:
     return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 
@@ -317,7 +329,7 @@ def _best_contiguous_w90_slice(
 ) -> tuple[int, dict[str, float]]:
     """Map a disentangled model to the target bands without manual band labels."""
     if len(dft) > len(w90):
-        raise ValueError("目标 DFT 能带数大于 Wannier 模型维数。")
+        raise IncompleteTargetSubspace(len(dft), len(w90))
     ranked: list[tuple[tuple[float, float, float], int, dict[str, float]]] = []
     for start in range(len(w90) - len(dft) + 1):
         metrics, _ = band_metrics(dft, w90[start:start + len(dft)], occupied_count)
