@@ -1,6 +1,8 @@
-# Wannier Workflow（W90Flow）
+# Wannier Workflow（W90Flow，Stage 1）
 
 这是从优化后 POSCAR 开始的确定性、AI-free 核心。结构集合可以有 1、2 或更多成员；`independent` 分别排名，`common_basis` 才强制共同投影，程序不假定材料是铁电体或一定存在 L1/L2。
+
+本仓库只负责 SCF/Band、候选、真实 Wannier 拟合、质量和 top-K 交付。新的 shift-current/SHG Python 核在相邻的 `../09_非线性光学Python/`，两者只通过 [NLO_HANDOFF.md](NLO_HANDOFF.md) 的冻结 manifest 接口连接。`response_plan.py`/`matlab_backend.py` 是迁移期兼容旧 MATLAB 队列的桥，暂不作为 Stage 2 新功能入口。
 
 > 当前状态：**private prepublication development**。不得在未完成 [DISCLOSURE.md](DISCLOSURE.md) 审查时改为 public。测试数据分层见 [FIXTURE_POLICY.md](FIXTURE_POLICY.md)。
 

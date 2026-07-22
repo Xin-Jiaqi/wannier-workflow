@@ -228,11 +228,18 @@ class RankingTests(unittest.TestCase):
             rank_dir = root / "06_rank"
             rank_dir.mkdir()
             (rank_dir / "candidate-ranking-v04.json").write_text(json.dumps(ranking), encoding="utf-8")
+            (root / "project.snapshot.yaml").write_text(
+                "physics:\n  soc: true\n  dimensionality: 2\n  axes: [x, y, z]\n",
+                encoding="utf-8",
+            )
             result = export_ranked_attempts(root)
             package = Path(result["packages"][0]["path"])
             self.assertTrue((package / "SnS2/wannier90-wcenter.dat").is_file())
             self.assertFalse(any(path.name == "POTCAR" for path in package.rglob("*")))
             self.assertEqual(result["ensemble_mode"], "independent")
+            manifest = json.loads((package / "package-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["physics"]["dimensionality"], 2)
+            self.assertTrue(manifest["physics"]["soc"])
 
     def test_target_mapping_and_complete_shell_tie_break(self) -> None:
         dft = [[(0.0, -1.0), (1.0, -0.8)], [(0.0, 1.0), (1.0, 1.2)]]

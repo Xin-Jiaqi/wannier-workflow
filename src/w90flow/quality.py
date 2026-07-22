@@ -688,6 +688,18 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
 def export_ranked_attempts(run_dir: str | Path) -> dict[str, Any]:
     """Export small, POTCAR-free top-K packages for downstream optics."""
     root = Path(run_dir).expanduser().resolve()
+    physics: dict[str, Any] = {}
+    snapshot = root / "project.snapshot.yaml"
+    if snapshot.is_file():
+        import yaml
+
+        with snapshot.open("r", encoding="utf-8") as handle:
+            project = yaml.safe_load(handle)
+        if isinstance(project, dict) and isinstance(project.get("physics"), dict):
+            source_physics = project["physics"]
+            for key in ("soc", "dimensionality", "axes", "energy_reference", "target_energy_eV"):
+                if key in source_physics:
+                    physics[key] = source_physics[key]
     ranking_path = root / "06_rank/candidate-ranking-v04.json"
     if not ranking_path.is_file():
         raise ValueError("请先运行 rank-attempts；缺少 candidate-ranking-v04.json。")
@@ -748,6 +760,7 @@ def export_ranked_attempts(run_dir: str | Path) -> dict[str, Any]:
             "projection": entry["projection"],
             "num_wann": entry["num_wann"],
             "nocc_model": entry["nocc_model"],
+            "physics": physics,
             item["metric_key"]: item["metrics"],
             "structures": {},
         }
