@@ -16,7 +16,7 @@ from w90flow.dataset import make_attempt_record
 from w90flow.material_pool import screen_c2db
 from w90flow.orchestrator import RunLock, WorkflowBlocked, choose_retry_reason, fit_from_precomputed, group_has_runnable_member, inspect_workflow, run_workflow
 from w90flow.parsers import parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_procar_orbital_scores
-from w90flow.quality import _best_contiguous_w90_slice, _common_attempt_ranking, _is_complete_sp, export_ranked_attempts
+from w90flow.quality import IncompleteTargetSubspace, _best_contiguous_w90_slice, _common_attempt_ranking, _is_complete_sp, export_ranked_attempts
 from w90flow.pipeline import audit_reference, plan_project
 from w90flow.pyw90_adapter import element_projection_envelope, parse_eig_suggest_output, parse_pre_dos_output
 from w90flow.ranking import Thresholds, audit_ranking_document, rank_common_candidates
@@ -479,6 +479,14 @@ class RankingTests(unittest.TestCase):
         self.assertLess(metrics["rmse_mev"], 2.0)
         self.assertTrue(_is_complete_sp(["X:s", "X:p", "Y:s", "Y:p"]))
         self.assertFalse(_is_complete_sp(["X:p", "Y:s", "Y:p"]))
+
+    def test_postfit_target_subspace_rejection_keeps_auditable_dimensions(self) -> None:
+        dft = [[(0.0, -1.0)], [(0.0, 1.0)]]
+        w90 = [[(0.0, -1.0)]]
+        with self.assertRaises(IncompleteTargetSubspace) as captured:
+            _best_contiguous_w90_slice(dft, w90, 1)
+        self.assertEqual(captured.exception.target_band_count, 2)
+        self.assertEqual(captured.exception.model_dimension, 1)
 
     def test_worst_member_ranking_and_rejection(self) -> None:
         good = {"mae_mev": 1, "rmse_mev": 2, "p95_mev": 3, "max_mev": 5, "gap_error_mev": 1}

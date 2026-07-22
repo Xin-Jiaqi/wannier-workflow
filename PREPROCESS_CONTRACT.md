@@ -59,6 +59,8 @@ POTCAR 没有任何猜测或自动下载：调用者必须提供以下二者之�
 
 POTCAR 只进入本地 run 的 `private/` 和各 VASP 阶段，不进入 Band/Wannier 导出包。
 
+在输入物化阶段，SOC 或 `LNONCOLLINEAR` 计算若显式写有 `MAGMOM`，其展开后必须恰好包含 `3 × NIONS` 个标量。压缩写法（例如 `6*0`）会先确定性展开计数；无法解析或维数错误时在 VASP 启动前拒绝。该预检只验证 INCAR/POSCAR 的形状兼容性，不生成磁矩，也不替用户选择磁序；未开启 SOC/非共线时不套用三分量规则。
+
 `begin_stage()` 使用原子阶段锁，记录 launcher PID、worker PID、命令、输入哈希和 attempt。行为如下：
 
 - 活 PID：拒绝重复提交；

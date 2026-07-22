@@ -360,6 +360,20 @@ class PreprocessStateTests(unittest.TestCase):
             3,
         )
 
+    def test_magmom_precheck_handles_collinear_mixed_and_invalid_tokens(self) -> None:
+        # Collinear MAGMOM remains one value per ion; the 3*NIONS rule must not
+        # be applied unless SOC/noncollinear mode is actually enabled.
+        validate_incar_structure_compatibility("LSORBIT = .FALSE.\nMAGMOM = 3*0\n", 3)
+        validate_incar_structure_compatibility(
+            "LNONCOLLINEAR = .TRUE.\nMAGMOM = 3*0 1.0 2*0 3*0\n",
+            3,
+        )
+        with self.assertRaisesRegex(PreprocessConfigError, "无法解析 MAGMOM token"):
+            validate_incar_structure_compatibility(
+                "LSORBIT = .TRUE.\nMAGMOM = 6*0 bad-token 3*0\n",
+                3,
+            )
+
     def test_prepare_materializes_locked_inputs_without_execution(self) -> None:
         config = normalize_preprocess_config(base_document(relaxation=False), 2)
         with tempfile.TemporaryDirectory() as temporary:

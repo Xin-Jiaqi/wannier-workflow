@@ -47,6 +47,7 @@ PyW90 在 v1.0 中是可选 baseline/adapter，不是必须依赖。主流程必
 - SCF 只有在 `POSCAR + POTCAR + INCAR + KPOINTS` 的 SHA256 全部相同时才复用；Band 还必须验证 `CHGCAR`；
 - Wannier attempt 同样必须满足 `CHGCAR` 相同，因此比较 `POSCAR + POTCAR + INCAR + KPOINTS + CHGCAR`；
 - 投影、`NUM_WANN`、排除带、外窗/冻结窗、SOC 或 Wannier 收敛参数只要有一个改变，就产生新的 INCAR/输入指纹并真实拟合；
+- `NUM_WANN` 必须覆盖受保护目标能区的 DFT 带流形；提交前和拟合后各检查一次，维数不足是确定性的质量拒绝，不进入能窗或收敛重试；
 - 复用只导入数值输出，不导入旧质量结论或旧排名。程序必须按本项目的目标能区和固定门槛重新验收。
 
 字节级哈希是保守规则：它可能因为无物理意义的文本差异多算一次，但不会把不同计算误当成相同计算。只有在以后加入经过测试的语义规范化器后，才允许放宽到“参数等价”。

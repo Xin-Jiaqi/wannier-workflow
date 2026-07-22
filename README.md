@@ -185,12 +185,14 @@ v1.0 的冻结范围、输入/输出、有限重试表和验收门槛见 [AUTOMA
 - SCF→Band→候选→Wannier→质量→排名→交付阶段契约；
 - EIGENVAL、OUTCAR、hr、centres、wout 关键解析；
 - 外窗每个 k 点至少 `NUM_WANN` 状态、冻结窗不超过 `NUM_WANN` 的硬约束；
+- 受保护目标能区内的 DFT 能带数不得超过 `NUM_WANN`：提交前直接淘汰不可能完备的候选，拟合后再次用实际 Wannier 模型维数复核，并以 `INCOMPLETE_TARGET_SUBSPACE` 留下可审计失败记录；
 - 同一候选必须覆盖所有相关结构，按最差一侧门槛/误差排序；
 - 由目标能区积分轨道权重生成有限的覆盖率/化学完备候选分支，并按 SOC 自动计算 `NUM_WANN`；
 - 可选 `candidates.pyw90_dos.enabled: true` 将 PyW90 `pre dos` 投影作为带工具/输入哈希的第二候选来源；重复投影去重，所有建议仍必须经过相同真实拟合与硬质量门槛；
 - 无人工价轨道答案时，从 PROCAR 自动生成 s/p/d/f 单壳层和完备壳层组合；p-only/complete-sp 只是自然特例，重复投影自动去重；
 - 三个现有实例作为回归测试。
 - 私有 POTCAR 拼接/哈希验证、SCF→Band CHGCAR 硬链接交接和显式执行保护；
+- SOC/非共线 INCAR 若显式给出 `MAGMOM`，提交前必须能解析为恰好 `3 × NIONS` 个分量；程序只检查维数，不猜磁构型，也不会把这条规则误用于普通共线计算；
 - 从真实 EIGENVAL+PROCAR 自动积分轨道权重；
 - exact-band 模型的通用 DFT/Wannier 误差、带隙、HR/中心、spread 检查与 PDF；
 - 单结构/共同基底的最小排名和无 POTCAR export。
