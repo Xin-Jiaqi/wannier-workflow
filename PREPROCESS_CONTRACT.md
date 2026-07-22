@@ -130,6 +130,20 @@ w90flow preprocess-run runs/material-001
 w90flow preprocess-run runs/material-001 --execute
 ```
 
+Band 通过后无需手抄路径；用优化后的 POSCAR 重新解析周期性和网格，直接进入
+Wannier top-K：
+
+```text
+w90flow fit-from-preprocess wannier-project.yaml \
+  --preprocess-source material-001=/absolute/runs/material-001 \
+  --runs-root /absolute/wannier-runs
+
+# 核验 dry-run 无误后才正式运行
+w90flow fit-from-preprocess wannier-project.yaml \
+  --preprocess-source material-001=/absolute/runs/material-001 \
+  --runs-root /absolute/wannier-runs --execute
+```
+
 等待器中断后，只有确认原 worker PID 已死亡才可清理锁；如果输出已经完整，先
 `reconcile`，不完整时再以同一冻结输入 `run --execute`：
 

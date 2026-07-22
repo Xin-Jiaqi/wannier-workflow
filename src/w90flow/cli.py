@@ -15,7 +15,7 @@ from .pyw90_adapter import run_eig_suggest
 from .quality import evaluate_attempt, evaluate_run, export_ranked_attempts, rank_attempts
 from .ranking import audit_ranking_document
 from .material_pool import screen_c2db, write_material_pool
-from .orchestrator import WORKFLOW_STOPS, fit_from_precomputed, inspect_workflow, run_workflow
+from .orchestrator import WORKFLOW_STOPS, fit_from_precomputed, fit_from_preprocess, inspect_workflow, run_workflow
 from .state import initialize_run, read_status, sha256_file
 from .preprocess import (
     PREPROCESS_STAGES,
@@ -126,6 +126,21 @@ def build_parser() -> argparse.ArgumentParser:
     fit_bands.add_argument("--band-source", action="append", required=True, help="STRUCTURE=/absolute/band-directory")
     fit_bands.add_argument("--until", choices=WORKFLOW_STOPS, default="export")
     fit_bands.add_argument("--execute", action="store_true")
+
+    fit_preprocess = sub.add_parser(
+        "fit-from-preprocess",
+        help="核验已完成的前处理交接，并用优化后结构自动进入 Wannier top-K",
+    )
+    fit_preprocess.add_argument("config")
+    fit_preprocess.add_argument("--runs-root", default="runs")
+    fit_preprocess.add_argument(
+        "--preprocess-source",
+        action="append",
+        required=True,
+        help="STRUCTURE=/absolute/preprocess-run",
+    )
+    fit_preprocess.add_argument("--until", choices=WORKFLOW_STOPS, default="export")
+    fit_preprocess.add_argument("--execute", action="store_true")
 
     inspect = sub.add_parser("inspect", help="只读显示自动状态机的下一动作")
     inspect.add_argument("run_dir")
@@ -331,6 +346,16 @@ def main(argv: list[str] | None = None) -> int:
             result = audit_reference(args.example_dir)
             _emit(result)
             return 0 if result.get("passed") else 1
+        elif args.command == "fit-from-preprocess":
+            result = fit_from_preprocess(
+                load_project(args.config),
+                args.runs_root,
+                _source_mappings(args.preprocess_source),
+                execute=args.execute,
+                until=args.until,
+            )
+            _emit(result)
+            return 0 if result.get("passed") or not args.execute else 1
         elif args.command == "audit-ranking":
             with Path(args.ranking_json).open("r", encoding="utf-8") as handle:
                 result = audit_ranking_document(json.load(handle))

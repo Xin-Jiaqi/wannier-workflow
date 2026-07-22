@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import socket
+import copy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,9 +13,10 @@ import yaml
 
 from .attempts import create_attempts, recorded_or_classified_failure, run_attempt
 from .executor import generate_candidates, import_completed_stage, prepare_run, reconcile_stage, run_vasp_stage
-from .parsers import parse_wout
+from .parsers import parse_poscar, parse_wout
+from .structure import resolve_periodicity, resolve_uniform_mesh
 from .quality import evaluate_attempt, export_ranked_attempts, rank_attempts
-from .state import atomic_json, read_json, read_status, update_stage
+from .state import atomic_json, read_json, read_status, sha256_file, update_stage
 
 
 WORKFLOW_STOPS = ("scf", "band", "candidates", "wannier", "quality", "rank", "export")
@@ -183,6 +185,97 @@ def fit_from_precomputed(
         "workflow": result,
         "passed": bool(result.get("passed")),
     }
+
+
+def fit_from_preprocess(
+    config: dict[str, Any],
+    runs_root: str | Path,
+    preprocess_sources: dict[str, str | Path],
+    *,
+    execute: bool = False,
+    until: str = "export",
+) -> dict[str, Any]:
+    """Verify completed preprocess handoffs and enter the Wannier state machine.
+
+    The optimized POSCAR can change lattice vectors, periodicity evidence and
+    reciprocal meshes.  Those derived fields are therefore recomputed here;
+    the original project YAML is never edited in place.
+    """
+    expected = {str(item["id"]) for item in config["structures"]}
+    if set(preprocess_sources) != expected:
+        raise ValueError("preprocess source 映射必须恰好覆盖 project 中的全部结构。")
+    rebound = copy.deepcopy(config)
+    scf_sources: dict[str, str] = {}
+    band_sources: dict[str, str] = {}
+    handoffs: dict[str, Any] = {}
+    dimensions: set[int] = set()
+    for structure in rebound["structures"]:
+        sid = str(structure["id"])
+        source = Path(preprocess_sources[sid]).expanduser().resolve()
+        protocol_path = source / "protocol.json"
+        handoff_path = source / "03_band/band-handoff.json"
+        if not protocol_path.is_file() or not handoff_path.is_file():
+            raise ValueError(f"{sid} 的 preprocess 尚无完整 protocol/band handoff：{source}")
+        protocol = read_json(protocol_path)
+        handoff = read_json(handoff_path)
+        requested_soc = bool(rebound["physics"].get("soc"))
+        if bool(protocol["soc"]["scf"]) != requested_soc or bool(protocol["soc"]["band"]) != requested_soc:
+            raise ValueError(f"{sid} 的 preprocess SCF/Band SOC 与 Stage-1 physics.soc 不一致。")
+        optimized = source / "02_scf/POSCAR"
+        if not optimized.is_file():
+            raise ValueError(f"{sid} 缺少优化后/冻结的 SCF POSCAR：{optimized}")
+        files = handoff.get("files")
+        if not isinstance(files, dict):
+            raise ValueError(f"{sid} 的 band-handoff.json 缺少 files 哈希。")
+        for name, record in files.items():
+            path = source / "03_band" / name
+            if not isinstance(record, dict) or record.get("path") != str(path) or not isinstance(record.get("sha256"), str):
+                raise ValueError(f"{sid} 的 Band handoff 记录无效：{name}")
+            if not path.is_file() or sha256_file(path) != record["sha256"]:
+                raise ValueError(f"{sid} 的 Band handoff 文件缺失或哈希改变：{name}")
+        parsed = parse_poscar(optimized)
+        analysis = resolve_periodicity(parsed, rebound["physics"])
+        structure["poscar_resolved"] = str(optimized)
+        structure["structure_analysis"] = analysis
+        dimensions.add(int(analysis["dimensionality"]))
+        meshes = rebound.get("meshes", {})
+        resolved_meshes: dict[str, list[int]] = {}
+        for role, specification in {
+            "scf": meshes.get("scf"),
+            "wannier": meshes.get("wannier", meshes.get("screening")),
+            "production": meshes.get("production"),
+        }.items():
+            if specification is not None:
+                resolved_meshes[role] = resolve_uniform_mesh(
+                    specification,
+                    parsed["lattice_angstrom"],
+                    analysis["periodic_axes"],
+                )
+        structure["meshes_resolved"] = resolved_meshes
+        for stage, directory in (("scf", source / "02_scf"), ("band", source / "03_band")):
+            rebound["templates"][stage]["incar_resolved"] = str(directory / "INCAR")
+            rebound["templates"][stage]["kpoints_resolved"] = str(directory / "KPOINTS")
+        scf_sources[sid] = str(source / "02_scf")
+        band_sources[sid] = str(source / "03_band")
+        handoffs[sid] = {
+            "preprocess_run": str(source),
+            "protocol_sha256": protocol["protocol_sha256"],
+            "band_handoff": str(handoff_path),
+            "optimized_poscar_sha256": sha256_file(optimized),
+            "structure_analysis": analysis,
+            "meshes_resolved": resolved_meshes,
+        }
+    if rebound.get("ensemble", {}).get("mode") == "common_basis" and len(dimensions) != 1:
+        raise ValueError("共同基底的 preprocess 结构必须具有相同 dimensionality。")
+    result = fit_from_precomputed(
+        rebound,
+        runs_root,
+        scf_sources,
+        band_sources,
+        execute=execute,
+        until=until,
+    )
+    return {**result, "preprocess_handoffs": handoffs}
 
 
 def _attempt_complete(directory: Path) -> bool:

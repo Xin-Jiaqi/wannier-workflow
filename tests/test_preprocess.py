@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from w90flow.cli import _preprocess_project, build_parser
+from w90flow.orchestrator import fit_from_preprocess
 from w90flow.preprocess import (
     PreprocessConfigError,
     StageBusyError,
@@ -430,6 +431,30 @@ else:
             handoff = read_json(run / "03_band/band-handoff.json")
             self.assertEqual(set(handoff["files"]), {"POSCAR", "OUTCAR", "EIGENVAL", "PROCAR", "vasprun.xml"})
             self.assertEqual(len(result["history"]), 2)
+
+            stage1 = {
+                "project": "synthetic-handoff",
+                "structures": [{"id": "X", "poscar_resolved": str(run / "02_scf/POSCAR")}],
+                "physics": {"soc": True, "dimensionality": "auto", "target_energy_eV": [-2.0, 2.0]},
+                "backend": {},
+                "ranking": {"output_top_k": 1},
+                "candidates": {"max_candidates": 1},
+                "ensemble": {"mode": "independent"},
+                "meshes": {"scf": [3, 3, 1], "wannier": [3, 3, 1]},
+                "templates": {
+                    "scf": {},
+                    "band": {},
+                    "wannier": {"incar_resolved": str(run / "02_scf/INCAR"), "kpoints_resolved": str(run / "02_scf/KPOINTS")},
+                },
+            }
+            handoff_preview = fit_from_preprocess(
+                stage1,
+                root / "wannier-runs",
+                {"X": run},
+                execute=False,
+            )
+            self.assertEqual(handoff_preview["mode"], "DRY_RUN")
+            self.assertEqual(handoff_preview["preprocess_handoffs"]["X"]["structure_analysis"]["dimensionality"], 2)
 
     def test_lock_refuses_duplicate_and_pass_refuses_resubmit(self) -> None:
         config = normalize_preprocess_config(base_document(relaxation=False), 2)
