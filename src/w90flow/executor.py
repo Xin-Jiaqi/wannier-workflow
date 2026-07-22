@@ -14,7 +14,7 @@ import yaml
 
 from .candidates import num_wann_from_projection, suggest_projection_candidates
 from .parsers import parse_eigenval, parse_fermi_outcar, parse_outcar_status, parse_poscar, parse_procar_orbital_scores, parse_wout
-from .pyw90_adapter import run_dos_suggest
+from .pyw90_adapter import element_projection_envelope, run_dos_suggest
 from .state import atomic_json, initialize_run, read_json, sha256_file, update_stage
 from .structure import (
     generate_ase_band_path,
@@ -530,12 +530,14 @@ def generate_candidates(run_dir: str | Path) -> dict[str, Any]:
                     output_json=output_json,
                 )
                 result = baseline["result"]
-                projection = list(result["projection"])
+                represented = element_projection_envelope(result, element_counts)
+                projection = list(represented["projection"])
                 expected_num_wann = num_wann_from_projection(projection, element_counts, soc)
-                if int(result["num_wann_selected"]) != expected_num_wann:
+                original_num_wann = int(result["num_wann_selected"])
+                if represented["representation"] != "element_level_envelope" and original_num_wann != expected_num_wann:
                     raise ValueError(
                         "PyW90 num_wann 与 POSCAR 元素计数/SOC 简并不一致："
-                        f"{result['num_wann_selected']} != {expected_num_wann}"
+                        f"{original_num_wann} != {expected_num_wann}"
                     )
                 pyw90_baseline = {
                     "enabled": True,
@@ -545,6 +547,11 @@ def generate_candidates(run_dir: str | Path) -> dict[str, Any]:
                     "tool_sha256": baseline["tool_sha256"],
                     "projection": projection,
                     "num_wann": expected_num_wann,
+                    "original_num_wann": original_num_wann,
+                    "representation": represented["representation"],
+                    "site_uniform": represented["site_uniform"],
+                    "site_projections": result.get("site_projections", []),
+                    "extra_input": result.get("extra_input"),
                     "fermi_eV_reported": result.get("fermi_eV"),
                     "dos_gap_eV": result.get("dos_gap_eV"),
                     "lower_bound": pyw90_lower_bound,
@@ -575,14 +582,19 @@ def generate_candidates(run_dir: str | Path) -> dict[str, Any]:
             projection = baseline.get("projection") if baseline.get("status") == "PASS" else None
             if projection and list(projection) not in [item[1] for item in unique]:
                 unique.append((sid, list(projection)))
-        external = [
-            {
-                "candidate": "pyw90-dos" if len(unique) == 1 else f"pyw90-dos-{sid}",
+        external = []
+        for sid, projection in unique:
+            baseline = analyses[sid]["pyw90_dos_baseline"]
+            envelope = baseline.get("representation") == "element_level_envelope"
+            if len(unique) == 1:
+                candidate = "pyw90-dos-envelope" if envelope else "pyw90-dos"
+            else:
+                candidate = f"pyw90-dos-envelope-{sid}" if envelope else f"pyw90-dos-{sid}"
+            external.append({
+                "candidate": candidate,
                 "projection": projection,
                 "candidate_family": "external_baseline",
-            }
-            for sid, projection in unique
-        ]
+            })
         if len(unique) > 1:
             union = list(dict.fromkeys(label for _, projection in unique for label in projection))
             if union not in [item[1] for item in unique]:

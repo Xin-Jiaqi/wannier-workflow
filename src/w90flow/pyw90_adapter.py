@@ -120,6 +120,41 @@ def parse_pre_dos_output(text: str) -> dict[str, Any]:
                 elif token in components:
                     projection.append(f"{element}:{token}")
     extra = re.search(r"pyw90 --extra input:\s*\n([^\n]+)", clean)
+    orbital_ids = {
+        0: "s", 1: "py", 2: "pz", 3: "px",
+        4: "dxy", 5: "dyz", 6: "dz2", 7: "dxz", 8: "dx2",
+    }
+
+    def expanded_indices(specification: str) -> list[int]:
+        values: list[int] = []
+        for token in specification.split("|"):
+            token = token.strip()
+            if re.fullmatch(r"\d+", token):
+                values.append(int(token))
+            elif match := re.fullmatch(r"(\d+)-(\d+)", token):
+                start, stop = map(int, match.groups())
+                if start > stop:
+                    raise ValueError("PyW90 extra input 的索引范围必须递增。")
+                values.extend(range(start, stop + 1))
+            else:
+                raise ValueError(f"无法解析 PyW90 extra input 索引：{token}")
+        return list(dict.fromkeys(values))
+
+    site_projections: list[dict[str, Any]] = []
+    if extra is not None:
+        for entry in extra.group(1).strip().split(";"):
+            fields = [field.strip() for field in entry.split(",")]
+            if len(fields) != 3 or not re.fullmatch(r"[A-Z][a-z]?", fields[0]):
+                continue
+            sites = expanded_indices(fields[1])
+            indices = expanded_indices(fields[2])
+            if any(index not in orbital_ids for index in indices):
+                raise ValueError(f"PyW90 extra input 含不支持的轨道 id：{indices}")
+            site_projections.append({
+                "element": fields[0],
+                "sites": sites,
+                "orbitals": [orbital_ids[index] for index in indices],
+            })
     return {
         "fermi_eV": None if fermi is None else float(fermi.group(1)),
         "dos_gap_eV": None if gap is None else float(gap.group(1)),
@@ -127,8 +162,64 @@ def parse_pre_dos_output(text: str) -> dict[str, Any]:
         "degeneracy": None if count is None else int(count.group(2)),
         "projection": list(dict.fromkeys(projection)),
         "wannier90_projection_lines": native_lines,
+        "site_projections": site_projections,
         "extra_input": None if extra is None else extra.group(1).strip(),
         "raw_text": clean.strip(),
+    }
+
+
+def element_projection_envelope(
+    result: dict[str, Any],
+    element_counts: dict[str, int],
+) -> dict[str, Any]:
+    """Map site-specific PyW90 advice to the smallest element-level superset.
+
+    W90Flow currently applies one projection specification to every atom of an
+    element.  If PyW90 selects different components on symmetry-inequivalent
+    sites, silently dropping those sites is wrong.  The auditable fallback is
+    the union over all sites, with complete component sets collapsed to their
+    angular shell.  The original site advice remains in the adapter document.
+    """
+    records = result.get("site_projections")
+    if not isinstance(records, list) or not records:
+        return {
+            "projection": list(result.get("projection") or []),
+            "representation": "native_element_lines",
+            "site_uniform": None,
+        }
+    by_element: dict[str, dict[int, set[str]]] = {element: {} for element in element_counts}
+    for record in records:
+        element = str(record.get("element"))
+        if element not in by_element:
+            raise ValueError(f"PyW90 位点建议元素不在 POSCAR 中：{element}")
+        orbitals = {str(value) for value in record.get("orbitals", [])}
+        for site in record.get("sites", []):
+            by_element[element].setdefault(int(site), set()).update(orbitals)
+
+    shell_components = {
+        "p": {"px", "py", "pz"},
+        "d": {"dxy", "dyz", "dz2", "dxz", "dx2"},
+    }
+    orbital_order = ("s", "p", "px", "py", "pz", "d", "dxy", "dyz", "dz2", "dxz", "dx2")
+    projection: list[str] = []
+    uniform = True
+    for element, count in element_counts.items():
+        site_sets = list(by_element[element].values())
+        if not site_sets:
+            continue
+        uniform = uniform and len(site_sets) == int(count) and all(values == site_sets[0] for values in site_sets[1:])
+        envelope = set().union(*site_sets)
+        for shell, components in shell_components.items():
+            if components <= envelope:
+                envelope.difference_update(components)
+                envelope.add(shell)
+        projection.extend(
+            f"{element}:{orbital}" for orbital in orbital_order if orbital in envelope
+        )
+    return {
+        "projection": projection,
+        "representation": "exact_element_level" if uniform else "element_level_envelope",
+        "site_uniform": uniform,
     }
 
 

@@ -18,7 +18,7 @@ from w90flow.orchestrator import RunLock, WorkflowBlocked, choose_retry_reason, 
 from w90flow.parsers import parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_procar_orbital_scores
 from w90flow.quality import _best_contiguous_w90_slice, _common_attempt_ranking, _is_complete_sp, export_ranked_attempts
 from w90flow.pipeline import audit_reference, plan_project
-from w90flow.pyw90_adapter import parse_eig_suggest_output, parse_pre_dos_output
+from w90flow.pyw90_adapter import element_projection_envelope, parse_eig_suggest_output, parse_pre_dos_output
 from w90flow.ranking import Thresholds, audit_ranking_document, rank_common_candidates
 from w90flow.state import initialize_run, read_status, update_stage
 from w90flow.supervisor import ProgressWatch, SupervisorLock, inspect_supervisor, progress_fingerprint, supervise_workflow
@@ -68,6 +68,9 @@ In,0-1,0-3;Se,2-3,1-3
         self.assertEqual(parsed["num_wann_selected"], 28)
         self.assertEqual(parsed["degeneracy"], 2)
         self.assertAlmostEqual(parsed["dos_gap_eV"], 1.3103)
+        represented = element_projection_envelope(parsed, {"In": 2, "Se": 2})
+        self.assertEqual(represented["projection"], ["In:s", "In:p", "Se:p"])
+        self.assertEqual(represented["representation"], "exact_element_level")
 
     def test_pyw90_pre_dos_component_projection_parser(self) -> None:
         parsed = parse_pre_dos_output(
@@ -85,6 +88,24 @@ In,0-1,0-1|3;Se,2-3,1|3
             num_wann_from_projection(parsed["projection"], {"In": 2, "Se": 2}, True),
             20,
         )
+
+    def test_pyw90_site_specific_advice_becomes_audited_element_envelope(self) -> None:
+        parsed = parse_pre_dos_output(
+            """Number of WFs selected: 8 (with degeneracy 1)
+Wannier90 Projection:
+f=0.000000,0.500000,0.572750:py;px
+f=0.500000,0.000000,0.427250:l=1
+Si:l=1
+
+pyw90 --extra input:
+S,1,1|3;S,2,1-3;Si,0,1-3
+"""
+        )
+        represented = element_projection_envelope(parsed, {"Si": 1, "S": 2})
+        self.assertEqual(represented["projection"], ["Si:p", "S:p"])
+        self.assertEqual(represented["representation"], "element_level_envelope")
+        self.assertFalse(represented["site_uniform"])
+        self.assertEqual(num_wann_from_projection(represented["projection"], {"Si": 1, "S": 2}, False), 9)
 
     def test_final_fermi_parser(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
