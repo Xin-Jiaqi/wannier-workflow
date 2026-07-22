@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from w90flow.config import load_project
-from w90flow.attempts import classify_failure, materialize_plan_energy_reference, plan_candidate, recorded_or_classified_failure
+from w90flow.attempts import classify_failure, import_completed_attempt, materialize_plan_energy_reference, plan_candidate, recorded_or_classified_failure
 from w90flow.candidates import num_wann_from_projection, suggest_projection_candidates
 from w90flow.dataset import make_attempt_record
 from w90flow.material_pool import screen_c2db
@@ -159,6 +159,24 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(disentangled["mode"], "disentanglement")
         self.assertLessEqual(disentangled["dis_win_min_eV"], disentangled["dis_froz_min_eV"])
         self.assertTrue(disentangled["containment_check"]["valid"])
+
+    def test_attempt_import_rejects_any_input_hash_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            target = root / "structures/X/04_wannier_attempts/p-only/attempt-001"
+            source = Path(temporary) / "source"
+            target.mkdir(parents=True)
+            source.mkdir()
+            (target / "attempt.json").write_text(
+                json.dumps({"status": "READY", "num_wann": 3}), encoding="utf-8"
+            )
+            for name in ("POSCAR", "POTCAR", "KPOINTS", "CHGCAR"):
+                (target / name).write_text("same", encoding="utf-8")
+                (source / name).write_text("same", encoding="utf-8")
+            (target / "INCAR").write_text("new", encoding="utf-8")
+            (source / "INCAR").write_text("old", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "INCAR SHA256"):
+                import_completed_attempt(root, "X", "p-only", "attempt-001", source)
 
     def test_mpi_socket_denial_is_infrastructure_not_numeric(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

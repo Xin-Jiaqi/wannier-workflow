@@ -12,7 +12,7 @@ from typing import Any
 
 import yaml
 
-from .parsers import parse_eigenval, parse_fermi_outcar, parse_poscar, parse_procar_orbital_scores, parse_wout
+from .parsers import parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_procar_orbital_scores, parse_wout
 from .state import atomic_json, read_json, sha256_file
 from .windows import minimum_outer_max, validate_frozen_window, validate_outer_window, validate_window_containment
 
@@ -459,6 +459,90 @@ def create_attempts(run_dir: str | Path) -> dict[str, Any]:
     }
     atomic_json(root / "03_candidates/attempt-plan.json", document)
     return document
+
+
+def import_completed_attempt(
+    run_dir: str | Path,
+    structure: str,
+    candidate: str,
+    attempt: str,
+    source: str | Path,
+) -> dict[str, Any]:
+    """Reuse a completed Wannier attempt only when every scientific input matches.
+
+    The imported numerical outputs are evaluated again against the *new* run's
+    declared target energy window and quality gates.  Historical quality or
+    ranking files are deliberately not imported.
+    """
+    root = Path(run_dir).expanduser().resolve()
+    target = root / "structures" / structure / "04_wannier_attempts" / candidate / attempt
+    source_dir = Path(source).expanduser().resolve()
+    record_path = target / "attempt.json"
+    if not record_path.is_file():
+        raise ValueError(f"找不到目标 attempt：{target}")
+    if not source_dir.is_dir():
+        raise ValueError(f"找不到来源 attempt：{source_dir}")
+    record = read_json(record_path)
+    if record.get("status") != "READY":
+        raise ValueError(f"目标 attempt 状态必须是 READY：{record.get('status')}")
+
+    input_names = ("POSCAR", "POTCAR", "INCAR", "KPOINTS", "CHGCAR")
+    input_hashes: dict[str, dict[str, str]] = {}
+    for name in input_names:
+        target_file = target / name
+        source_file = source_dir / name
+        if not target_file.is_file() or not source_file.is_file():
+            raise ValueError(f"复用输入缺少 {name}：target={target_file.is_file()} source={source_file.is_file()}")
+        target_hash = sha256_file(target_file)
+        source_hash = sha256_file(source_file)
+        input_hashes[name] = {"target": target_hash, "source": source_hash}
+        if target_hash != source_hash:
+            raise ValueError(f"拒绝复用：{name} SHA256 不一致。")
+
+    required_outputs = (
+        "wannier90.win",
+        "wannier90.wout",
+        "wannier90_hr.dat",
+        "wannier90_centres.xyz",
+        "wannier90_band.dat",
+    )
+    for name in required_outputs:
+        if not (source_dir / name).is_file():
+            raise ValueError(f"来源 attempt 缺少完成输出：{name}")
+    if not parse_wout(source_dir / "wannier90.wout")["completed"]:
+        raise ValueError("来源 wannier90.wout 未正常完成。")
+    hr = parse_hr_header(source_dir / "wannier90_hr.dat")
+    if int(hr["num_wann"]) != int(record["num_wann"]):
+        raise ValueError("来源 HR 维数与目标 NUM_WANN 不一致。")
+
+    materialization: dict[str, str] = {}
+    optional_outputs = ("wannier90_band.gnu", "wannier90_band.kpt")
+    for name in (*required_outputs, *optional_outputs):
+        source_file = source_dir / name
+        if source_file.is_file():
+            materialization[name] = _link_or_copy(source_file, target / name)
+    record.update({
+        "status": "PASS",
+        "finished_utc": _utc_now(),
+        "returncode": 0,
+        "failure_class": None,
+        "next_action": None,
+        "missing_outputs": [],
+        "imported_completed_attempt": {
+            "source": str(source_dir),
+            "input_sha256": input_hashes,
+            "materialization": materialization,
+            "policy": "all_scientific_inputs_sha256_identical_re_evaluate_quality",
+        },
+    })
+    atomic_json(record_path, record)
+    return {
+        "passed": True,
+        "target": str(target),
+        "source": str(source_dir),
+        "input_sha256": input_hashes,
+        "materialization": materialization,
+    }
 
 
 def classify_failure(directory: Path, returncode: int) -> str | None:

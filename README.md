@@ -117,6 +117,15 @@ Wannier 拟合与非线性光学求和器保持为两个独立程序。核心交
 
 `reconcile RUN_DIR scf|band|wannier` 只根据完整输出回收后台状态，不会重复提交。
 
+已有 Wannier attempt 只有在 `POSCAR + POTCAR + INCAR + KPOINTS + CHGCAR` 五个 SHA256 全部相同时才能复用；复用后仍按新项目的目标能区和门槛重新评价，不导入旧排名：
+
+```bash
+运行W90Flow.command import-attempt RUN_DIR STRUCTURE CANDIDATE attempt-001 \
+  --source /absolute/completed/attempt
+```
+
+只要投影、`NUM_WANN`、排除带、能窗或收敛参数造成 INCAR 变化，命令就拒绝复用并要求真实拟合。
+
 当 SCF/Band 的 `POSCAR + POTCAR + INCAR + KPOINTS` 四个哈希完全一致时，可以零复制复用已完成阶段；任何一个输入不同都会拒绝：
 
 ```bash
@@ -163,6 +172,8 @@ v1.0 的冻结范围、输入/输出、有限重试表和验收门槛见 [AUTOMA
 - 新增 top-K→MATLAB 响应计划层：自动传递 `nocc_model`、串行作业、PID/指纹断点和旧 MATLAB 活进程附着等待。
 
 数据集与跨数据库 benchmark 的字段、切分和 ML 路线见 [DATASET_AND_BENCHMARK.md](DATASET_AND_BENCHMARK.md)。
+
+为了防止根据三个已知答案不断补特例，候选规则的开发集/冻结盲测集/外部盲测集和评分方式见 [GENERALIZATION_PROTOCOL.md](GENERALIZATION_PROTOCOL.md)。
 
 下一步只收敛 v1.0：端到端模拟/中断测试、PyW90 对照 adapter、BiTeI/InSe 输出回放和一次小型冷启动。生产网格与 top-K 下游 shift-current/SHG 在 v1.0 验收后再展开。
 

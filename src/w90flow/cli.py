@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import ConfigError, load_project
-from .attempts import create_attempts, run_attempt
+from .attempts import create_attempts, import_completed_attempt, run_attempt
 from .candidates import suggest_projection_candidates
 from .executor import finalize_run, generate_candidates, import_completed_stage, prepare_run, reconcile_stage, run_vasp_stage
 from .parsers import parse_eigenval
@@ -131,6 +131,16 @@ def build_parser() -> argparse.ArgumentParser:
     run_attempt_parser.add_argument("attempt")
     run_attempt_parser.add_argument("--execute", action="store_true")
 
+    import_attempt_parser = sub.add_parser(
+        "import-attempt",
+        help="仅在五个科学输入 SHA256 完全一致时复用已完成 Wannier 数值输出",
+    )
+    import_attempt_parser.add_argument("run_dir")
+    import_attempt_parser.add_argument("structure")
+    import_attempt_parser.add_argument("candidate")
+    import_attempt_parser.add_argument("attempt")
+    import_attempt_parser.add_argument("--source", required=True)
+
     evaluate_attempt_parser = sub.add_parser("evaluate-attempt", help="在统一目标能区评估指定候选 attempt")
     evaluate_attempt_parser.add_argument("run_dir")
     evaluate_attempt_parser.add_argument("structure")
@@ -252,6 +262,16 @@ def main(argv: list[str] | None = None) -> int:
             _emit(create_attempts(args.run_dir))
         elif args.command == "run-attempt":
             result = run_attempt(args.run_dir, args.structure, args.candidate, args.attempt, execute=args.execute)
+            _emit(result)
+            return 0 if result.get("passed") else 1
+        elif args.command == "import-attempt":
+            result = import_completed_attempt(
+                args.run_dir,
+                args.structure,
+                args.candidate,
+                args.attempt,
+                args.source,
+            )
             _emit(result)
             return 0 if result.get("passed") else 1
         elif args.command == "evaluate-attempt":
