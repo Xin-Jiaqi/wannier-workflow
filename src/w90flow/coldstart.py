@@ -261,7 +261,7 @@ def run_stage1_coldstart(
             preprocess_runs = {
                 item["id"]: str(
                     runs / "preprocess" /
-                    f"{config['project']}-{item['id']}-{signature['config_sha256'][:8]}-{item['poscar_sha256'][:8]}"
+                    f"{config['project']}-{item['id']}-{signature_sha256[:8]}-{item['poscar_sha256'][:8]}"
                 )
                 for item in plan["structures"]
             }

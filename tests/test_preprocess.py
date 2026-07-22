@@ -29,6 +29,7 @@ from w90flow.preprocess import (
     run_preprocess_workflow,
     standard_semilocal_preprocess,
     stage_incar_contract,
+    validate_incar_structure_compatibility,
 )
 from w90flow.state import atomic_json, read_json
 
@@ -348,6 +349,17 @@ class ConvergenceTests(unittest.TestCase):
 
 
 class PreprocessStateTests(unittest.TestCase):
+    def test_soc_magmom_cardinality_is_checked_before_vasp(self) -> None:
+        with self.assertRaisesRegex(PreprocessConfigError, "3\\*NIONS=9"):
+            validate_incar_structure_compatibility(
+                "LSORBIT = .TRUE.\nLNONCOLLINEAR = .TRUE.\nMAGMOM = 3*0\n",
+                3,
+            )
+        validate_incar_structure_compatibility(
+            "LSORBIT = .TRUE.\nLNONCOLLINEAR = .TRUE.\nMAGMOM = 9*0\n",
+            3,
+        )
+
     def test_prepare_materializes_locked_inputs_without_execution(self) -> None:
         config = normalize_preprocess_config(base_document(relaxation=False), 2)
         with tempfile.TemporaryDirectory() as temporary:

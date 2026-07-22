@@ -678,6 +678,48 @@ def patch_incar_contract(template_text: str, contract: Mapping[str, Any]) -> str
     return "\n".join(lines).rstrip() + "\n"
 
 
+def validate_incar_structure_compatibility(incar_text: str, atom_count: int) -> None:
+    """Reject deterministic INCAR/POSCAR cardinality errors before VASP.
+
+    VASP treats spin-orbit calculations as noncollinear.  If MAGMOM is
+    explicitly supplied, it therefore needs three components per ion.  This is
+    a syntax/shape check only; it never invents a magnetic configuration.
+    """
+    if atom_count <= 0:
+        raise PreprocessConfigError("POSCAR 原子数必须大于零。")
+
+    def assignment(key: str) -> str | None:
+        pattern = re.compile(rf"^\s*{re.escape(key)}\s*=\s*([^!#]+)", re.IGNORECASE)
+        values = [match.group(1).strip() for line in incar_text.splitlines() if (match := pattern.match(line))]
+        if len(values) > 1:
+            raise PreprocessConfigError(f"INCAR 中 {key} 重复；拒绝猜测生效值。")
+        return values[0] if values else None
+
+    def enabled(value: str | None) -> bool:
+        return value is not None and value.strip().upper() in {"T", ".T.", "TRUE", ".TRUE."}
+
+    if not (enabled(assignment("LSORBIT")) or enabled(assignment("LNONCOLLINEAR"))):
+        return
+    magmom = assignment("MAGMOM")
+    if magmom is None:
+        return
+    count = 0
+    for token in magmom.replace(",", " ").split():
+        repeated = re.fullmatch(r"(\d+)\*[-+0-9.eEdD]+", token)
+        scalar = re.fullmatch(r"[-+0-9.eEdD]+", token)
+        if repeated:
+            count += int(repeated.group(1))
+        elif scalar:
+            count += 1
+        else:
+            raise PreprocessConfigError(f"无法解析 MAGMOM token：{token}")
+    expected = 3 * atom_count
+    if count != expected:
+        raise PreprocessConfigError(
+            f"SOC/noncollinear MAGMOM 必须有 3*NIONS={expected} 个分量；当前为 {count}。"
+        )
+
+
 def _validate_command(command: Any, stage: str, stage_dir: Path) -> list[str]:
     if not isinstance(command, list) or not command or any(not isinstance(item, str) or not item for item in command):
         raise PreprocessConfigError(f"commands.{stage} 必须是非空字符串列表；不接受 shell 字符串。")
@@ -838,6 +880,7 @@ def materialize_preprocess_inputs(
             source_incar.read_text(encoding="utf-8", errors="strict"),
             stage_incar_contract(config, stage),
         )
+        validate_incar_structure_compatibility(patched_incar, sum(structure["counts"]))
         _write_exact_bytes(directory / "INCAR", patched_incar.encode("utf-8"))
         kpoints_mode = _copy_exact(source_kpoints, directory / "KPOINTS")
         potcar_mode = _copy_exact(private_potcar, directory / "POTCAR")
