@@ -38,6 +38,17 @@ PyW90 在 v1.0 中是可选 baseline/adapter，不是必须依赖。主流程必
 - 完整的通过/失败 attempt 数据和失败类别；
 - 不含 POTCAR、CHGCAR、MMN/AMN 等大型或许可文件。
 
+### 何时复用，何时必须重算
+
+程序不靠材料名称或历史最佳答案判断是否重算，只比较本次实际科学输入：
+
+- SCF/Band 只有在 `POSCAR + POTCAR + INCAR + KPOINTS` 的 SHA256 全部相同时才复用；
+- Wannier attempt 还必须同时满足 `CHGCAR` 相同，因此比较 `POSCAR + POTCAR + INCAR + KPOINTS + CHGCAR`；
+- 投影、`NUM_WANN`、排除带、外窗/冻结窗、SOC 或 Wannier 收敛参数只要有一个改变，就产生新的 INCAR/输入指纹并真实拟合；
+- 复用只导入数值输出，不导入旧质量结论或旧排名。程序必须按本项目的目标能区和固定门槛重新验收。
+
+字节级哈希是保守规则：它可能因为无物理意义的文本差异多算一次，但不会把不同计算误当成相同计算。只有在以后加入经过测试的语义规范化器后，才允许放宽到“参数等价”。
+
 ## 3. 有限状态机
 
 ```text
@@ -67,6 +78,7 @@ prepare → SCF → Band/PROCAR → candidates → finite attempts
 - 单结构、多结构 independent 和 common-basis 都可用；共同基底不得混用不同 attempt/能窗。
 - 支持 exact 和真实 disentanglement；SOC 自动维数必须正确。
 - 回归夹具通过 BiTeI nSOC、BiTeI SOC pair 和 InSe SOC pair；InSe 必须真正走 disentanglement 分支。
+- 开发集只用于暴露缺口；冻结候选规则后必须在未参与规则修改的材料上报告 blind pass rate、top-K regret 和实际 attempt 成本。任何用于改规则的盲测材料立即转入开发集。
 - 完成一次冷启动端到端测试、一次人为中断/恢复测试，且 top-K/哈希结果可复现。
 - PyW90 对照输出不得改变硬门槛；与内部候选不一致时同时保留两者供审计。
 - 单元/集成测试、CLI 帮助、版本化 schema、一页用法和失败说明齐全。

@@ -76,15 +76,24 @@ python -m w90flow.response_plan run response-plan-InSe --execute
 - 两者都从每个模型目录读 `wannier90_hr.dat + wannier90-wcenter.dat + POSCAR`；
 - 旧串行脚本的外层 project/profile 接口是为 InSe/SnS2 硬编的，新 backend 因此直接调用其已有科学核，而不复制或改写公式。
 
-## 真正一键执行前仍缺的冻结参数
+## 自动生成与仍需声明的内容
 
-对新材料，top-K manifest 并不包含下列科学选择，Python 不会猜测：
+避免使用“冻结物理参数”这种含混说法。连接层应把输入分为两类：
 
-1. 对称性允许且需要计算的 shift-current/SHG 张量分量，以及坐标轴与晶格方向的映射。
-2. screening/production 的 k 网格、光子能量范围/点数、shift-current 宽化和 SHG 谱宽化。
-3. 每种材料的有效厚度数值与统一定义（几何厚度、层间距或其他规范）。
-4. SOC/非 SOC 下的自旋简并因子与符号约定。当前 shift-current 核在现有 SOC 项目里固定为不额外乘 2；SHG 旧基线固定 `spin_degeneracy=1, sign_factor=1`。
-5. MATLAB 可执行文件/许可证环境、Parallel Computing Toolbox 可用性，以及每台机器允许的 workers 上限。
-6. 响应结果的独立 full-r/其他实现交叉验证门槛。当前两个 MATLAB 核都是 `hr + centres` 的 diagonal-TBA 路径，不应自动升格为绝对第一性原理结论。
+程序可以直接得到：
+
+1. `NOCC`：读取 Wannier 交付清单中的 `nocc_model`；
+2. 维度和默认 k 网格：二维默认 `71×71×1`，三维默认 `51×51×51`；维度优先读取项目元数据，并用 POSCAR 几何复核；
+3. 待计算张量：由 POSCAR 的点群操作按 Neumann 原理得到允许、为零及相等/反号的三阶张量分量；shift current 与 SHG 各自处理末两指标交换关系；
+4. 输入目录、结构名称、rank、投影和 HR 哈希：全部来自 top-K manifest。
+
+项目仍需明确一次：
+
+1. 光子能量范围/点数和展宽 profile；
+2. 二维结果若换算成体响应时采用的有效厚度定义。真空层高度不能自动当材料厚度，因此最好同时保留 sheet response；
+3. SOC/非 SOC 的自旋因子和符号约定；
+4. 响应近似及交叉验证门槛。当前 `hr + centres` 路径采用 diagonal-TBA，不能因为自动运行就视为无近似结果。
+
+当前代码已完成第 1 项 `NOCC` 自动读取；默认网格和对称性张量生成尚未接入 `response_plan.py`，在此之前配置文件仍需显式写出 `kmesh/components`。
 
 另外，旧 SHG 核的 `metadata.nocc_physical_status` 仍写为 `unverified`。新 backend 已从 manifest/quality 硬校验 `nocc_model`，但如需让 MATLAB 结果内部也显式记录“已验证”，仍需旧 MATLAB 接口新增 provenance/status 字段；本次没有修改该科学代码。
