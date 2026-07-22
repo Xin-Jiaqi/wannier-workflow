@@ -1,0 +1,27 @@
+__pycache__/
+._*
+.DS_Store
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+.venv/
+venv/
+dist/
+build/
+runs/
+
+# Licensed or large VASP runtime artifacts must never enter Git history.
+**/POTCAR
+**/CHG
+**/CHGCAR
+**/WAVECAR
+**/WAVEDER
+**/*.amn
+**/*.mmn
+**/*.unk
+
+# Local research fixtures/results are mounted explicitly, never vendored.
+tests/fixtures/references/
+research-data/
+private-data/

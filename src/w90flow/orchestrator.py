@@ -1,0 +1,475 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import socket
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from .attempts import create_attempts, recorded_or_classified_failure, run_attempt
+from .executor import generate_candidates, reconcile_stage, run_vasp_stage
+from .parsers import parse_wout
+from .quality import evaluate_attempt, export_ranked_attempts, rank_attempts
+from .state import atomic_json, read_json, read_status, update_stage
+
+
+WORKFLOW_STOPS = ("scf", "band", "candidates", "wannier", "quality", "rank", "export")
+STAGE_NAME = {
+    "validate": "00_validate",
+    "scf": "01_scf",
+    "band": "02_band",
+    "candidates": "03_candidates",
+    "wannier": "04_wannier",
+    "quality": "05_quality",
+    "rank": "06_rank",
+    "export": "07_export",
+}
+
+WINDOW_FAILURES = {
+    "NOT_ENOUGH_STATES",
+    "TOO_MANY_FROZEN_STATES",
+    "INVALID_WINDOW_CONTAINMENT",
+    "BAND_CONNECTIVITY_FAILED",
+    "QUALITY_GATE_FAILED",
+}
+CONVERGENCE_FAILURES = {"DISENTANGLEMENT_NOT_CONVERGED", "LOCALIZATION_NOT_CONVERGED"}
+
+
+class WorkflowBlocked(RuntimeError):
+    """Raised when deterministic safe progress is impossible."""
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+class RunLock:
+    """Single-host lock preventing duplicate heavy workflows for one run."""
+
+    def __init__(self, run_dir: Path):
+        self.path = run_dir / ".w90flow.lock"
+        self.acquired = False
+
+    def __enter__(self) -> "RunLock":
+        if self.path.exists():
+            try:
+                old = read_json(self.path)
+                old_pid = int(old.get("pid") or 0)
+                old_host = str(old.get("host") or "")
+            except (OSError, ValueError, json.JSONDecodeError):
+                old_pid, old_host = 0, ""
+            if old_host == socket.gethostname() and _pid_alive(old_pid):
+                raise WorkflowBlocked(f"同一 run 已由 PID {old_pid} 执行，拒绝重复重作业。")
+            stem = f".w90flow.lock.stale-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{old_pid}"
+            stale = self.path.with_name(stem)
+            suffix = 1
+            while stale.exists():
+                stale = self.path.with_name(f"{stem}-{suffix:02d}")
+                suffix += 1
+            os.replace(self.path, stale)
+        try:
+            descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as exc:
+            raise WorkflowBlocked("另一个监督器刚刚获得了同一 run 的锁，拒绝重复执行。") from exc
+        try:
+            payload = {
+                "schema_version": 1,
+                "pid": os.getpid(),
+                "host": socket.gethostname(),
+                "created_utc": _utc_now(),
+            }
+            os.write(descriptor, (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        finally:
+            os.close(descriptor)
+        self.acquired = True
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if not self.acquired or not self.path.exists():
+            return
+        try:
+            current = read_json(self.path)
+        except (OSError, json.JSONDecodeError):
+            current = {}
+        if int(current.get("pid") or 0) == os.getpid():
+            self.path.unlink()
+
+
+def _load_snapshot(root: Path) -> dict[str, Any]:
+    with (root / "project.snapshot.yaml").open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+    if not isinstance(config, dict):
+        raise ValueError("project.snapshot.yaml 无效。")
+    return config
+
+
+def _stage_status(root: Path, short_name: str) -> str:
+    return str(read_json(root / STAGE_NAME[short_name] / "stage.json").get("status", "UNKNOWN"))
+
+
+def inspect_workflow(run_dir: str | Path) -> dict[str, Any]:
+    root = Path(run_dir).expanduser().resolve()
+    statuses = read_status(root)["stages"]
+    next_action: dict[str, Any] = {"action": "complete"}
+    for item in statuses:
+        if item["status"] != "PASS":
+            stage = str(item["stage"])
+            next_action = {
+                "action": "advance_stage",
+                "stage": stage,
+                "status": item["status"],
+            }
+            break
+    return {
+        "schema_version": 1,
+        "run_dir": str(root),
+        "stages": statuses,
+        "next_action": next_action,
+        "locked": (root / ".w90flow.lock").is_file(),
+    }
+
+
+def _attempt_complete(directory: Path) -> bool:
+    required = ("wannier90.wout", "wannier90_hr.dat", "wannier90_centres.xyz", "wannier90_band.dat")
+    if not all((directory / name).is_file() for name in required):
+        return False
+    try:
+        return bool(parse_wout(directory / "wannier90.wout")["completed"])
+    except (OSError, ValueError):
+        return False
+
+
+def _recover_attempt(directory: Path, record: dict[str, Any]) -> dict[str, Any]:
+    if record.get("status") != "RUNNING":
+        return record
+    active = record.get("active_process") or {}
+    pid = int(active.get("pid") or 0)
+    if _pid_alive(pid):
+        raise WorkflowBlocked(f"attempt worker PID {pid} 仍在运行：{directory}")
+    if _attempt_complete(directory):
+        record.update({"status": "PASS", "reconciled_utc": _utc_now(), "active_process": None})
+    else:
+        record.update({
+            "status": "FAIL",
+            "finished_utc": _utc_now(),
+            "returncode": -1,
+            "failure_class": "INFRASTRUCTURE_FAILURE",
+            "next_action": "retry_same_attempt_once_after_environment_check",
+            "active_process": None,
+            "recovered_orphan": True,
+        })
+    atomic_json(directory / "attempt.json", record)
+    return record
+
+
+def _attempt_records(root: Path, structure: str, candidate: str) -> dict[str, tuple[Path, dict[str, Any]]]:
+    candidate_root = root / "structures" / structure / "04_wannier_attempts" / candidate
+    records: dict[str, tuple[Path, dict[str, Any]]] = {}
+    for record_path in sorted(candidate_root.glob("attempt-*/attempt.json")):
+        directory = record_path.parent
+        record = _recover_attempt(directory, read_json(record_path))
+        records[str(record["attempt"])] = (directory, record)
+    return records
+
+
+def _retry_reason(record: dict[str, Any]) -> str:
+    plan = record.get("plan_reference", record.get("plan", {}))
+    if plan.get("mode") == "exact":
+        return "exact"
+    return str(plan.get("retry_reason") or "seed")
+
+
+def choose_retry_reason(failures: list[str | None], attempted_reasons: set[str]) -> str | None:
+    """Choose one finite deterministic branch; never relax quality thresholds."""
+    clean = {failure for failure in failures if failure}
+    if "NUMERIC_FAILURE" in clean:
+        raise WorkflowBlocked("数值失败不能通过自动放宽科学参数处理。")
+    if "INFRASTRUCTURE_FAILURE" in clean:
+        return "same"
+    if clean & CONVERGENCE_FAILURES and "convergence_retry" not in attempted_reasons:
+        return "convergence_retry"
+    if clean & WINDOW_FAILURES and "outer_window_expansion" not in attempted_reasons:
+        return "outer_window_expansion"
+    return None
+
+
+def group_has_runnable_member(statuses: set[str]) -> bool:
+    """Resume a partially completed common attempt without rerunning members."""
+    return "READY" in statuses and statuses <= {"READY", "PASS", "ACCEPTED"}
+
+
+def _evaluate_pass_records(root: Path, structures: list[str], candidate: str, attempt: str) -> None:
+    for sid in structures:
+        directory, record = _attempt_records(root, sid, candidate)[attempt]
+        if record.get("status") == "PASS":
+            evaluate_attempt(root, sid, candidate, attempt)
+
+
+def _common_attempt_passed(root: Path, structures: list[str], candidate: str, attempt: str) -> bool:
+    records = [_attempt_records(root, sid, candidate).get(attempt) for sid in structures]
+    return all(item is not None and item[1].get("status") == "ACCEPTED" for item in records)
+
+
+def _process_candidate(
+    root: Path,
+    structures: list[str],
+    candidate: str,
+) -> dict[str, Any]:
+    attempted_reasons: set[str] = set()
+    previous_failures: list[str | None] = []
+    while True:
+        by_structure = {sid: _attempt_records(root, sid, candidate) for sid in structures}
+        common_labels = set.intersection(*(set(records) for records in by_structure.values())) if by_structure else set()
+        if not common_labels:
+            return {"candidate": candidate, "passed": False, "reason": "no_common_attempt_plan"}
+        for label in sorted(common_labels):
+            _evaluate_pass_records(root, structures, candidate, label)
+            if _common_attempt_passed(root, structures, candidate, label):
+                return {"candidate": candidate, "attempt": label, "passed": True}
+
+        terminal: list[tuple[str, list[dict[str, Any]]]] = []
+        ready: dict[str, list[dict[str, Any]]] = {}
+        for label in sorted(common_labels):
+            group = [_attempt_records(root, sid, candidate)[label][1] for sid in structures]
+            reason = _retry_reason(group[0])
+            if any(_retry_reason(item) != reason for item in group):
+                raise WorkflowBlocked(f"{candidate}/{label} 在相关结构间使用了不同计划。")
+            statuses = {str(item.get("status")) for item in group}
+            if group_has_runnable_member(statuses):
+                ready[label] = group
+            elif statuses & {"FAIL", "REJECTED_QUALITY"}:
+                terminal.append((label, group))
+
+        if not terminal and ready:
+            selected = min(ready)
+        else:
+            if terminal:
+                last_label, last_group = terminal[-1]
+                last_reason = _retry_reason(last_group[0])
+                attempted_reasons.add(last_reason)
+                previous_failures = [
+                    str(item.get("failure_class")) if item.get("failure_class") else None
+                    for item in last_group
+                ]
+                if "INFRASTRUCTURE_FAILURE" in previous_failures:
+                    retryable = []
+                    for sid in structures:
+                        directory, record = _attempt_records(root, sid, candidate)[last_label]
+                        history = list(record.get("execution_history", []))
+                        if record.get("failure_class") == "INFRASTRUCTURE_FAILURE" and not history:
+                            retryable.append(sid)
+                    if retryable:
+                        selected = last_label
+                    else:
+                        desired = choose_retry_reason(previous_failures, attempted_reasons)
+                        selected = next((label for label, group in ready.items() if _retry_reason(group[0]) == desired), "")
+                else:
+                    desired = choose_retry_reason(previous_failures, attempted_reasons)
+                    selected = next((label for label, group in ready.items() if _retry_reason(group[0]) == desired), "")
+            else:
+                selected = ""
+            if not selected:
+                return {
+                    "candidate": candidate,
+                    "passed": False,
+                    "reason": "finite_attempts_exhausted",
+                    "failures": previous_failures,
+                }
+
+        for sid in structures:
+            directory, record = _attempt_records(root, sid, candidate)[selected]
+            status = str(record.get("status"))
+            if status in {"READY"} or (
+                status == "FAIL"
+                and recorded_or_classified_failure(record, directory) == "INFRASTRUCTURE_FAILURE"
+                and not list(record.get("execution_history", []))
+            ):
+                result = run_attempt(root, sid, candidate, selected, execute=True)
+                if not result.get("passed") and result["attempt"].get("failure_class") == "NUMERIC_FAILURE":
+                    raise WorkflowBlocked(f"{sid}/{candidate}/{selected} 数值失败。")
+
+
+def _candidate_layout(config: dict[str, Any], spec: dict[str, Any]) -> list[tuple[list[str], str]]:
+    structures = [str(item["id"]) for item in config["structures"]]
+    if spec["ensemble_mode"] == "common_basis":
+        return [(structures, str(candidate["candidate"])) for candidate in spec["shared_candidates"]]
+    return [
+        ([sid], str(candidate["candidate"]))
+        for sid in structures
+        for candidate in spec["independent_candidates"][sid]
+    ]
+
+
+def _accepted_coverage(root: Path, config: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
+    structures = [str(item["id"]) for item in config["structures"]]
+    accepted: dict[str, list[str]] = {sid: [] for sid in structures}
+    for sid in structures:
+        for quality_path in sorted((root / "structures" / sid / "04_wannier_attempts").glob("*/attempt-*/quality.json")):
+            quality = read_json(quality_path)
+            if quality.get("passed"):
+                accepted[sid].append(f"{quality['candidate']}/{quality['attempt']}")
+        baseline = root / "structures" / sid / "05_quality/quality.json"
+        if baseline.is_file() and read_json(baseline).get("passed"):
+            accepted[sid].append("baseline")
+    if spec["ensemble_mode"] == "common_basis":
+        common = set(accepted[structures[0]]) if structures else set()
+        for sid in structures[1:]:
+            common &= set(accepted[sid])
+        passed = bool(common)
+    else:
+        common = set()
+        passed = all(accepted[sid] for sid in structures)
+    return {"passed": passed, "accepted": accepted, "common": sorted(common)}
+
+
+def _ensure_vasp_stage(root: Path, stage: str, events: list[dict[str, Any]]) -> None:
+    if _stage_status(root, stage) == "PASS":
+        events.append({"stage": stage, "action": "skip_passed"})
+        return
+    if _stage_status(root, stage) == "RUNNING":
+        stage_name = STAGE_NAME[stage]
+        state_path = root / stage_name / "stage.json"
+        state = read_json(state_path)
+        active = state.get("active_process") or {}
+        active_pid = int(active.get("pid") or 0)
+        if _pid_alive(active_pid):
+            raise WorkflowBlocked(f"{stage} worker PID {active_pid} 仍在运行，拒绝重复提交。")
+        reconciled = reconcile_stage(root, stage)
+        if reconciled.get("passed"):
+            events.append({"stage": stage, "action": "reconciled"})
+            return
+        recovery_history = list(state.get("recovery_history", []))
+        if recovery_history:
+            raise WorkflowBlocked(f"{stage} 的一次中断恢复预算已用完，需人工检查环境。")
+        archived_logs: list[str] = []
+        for structure_dir in sorted((root / "structures").iterdir()):
+            source = structure_dir / stage_name / "runner.log"
+            target = structure_dir / stage_name / "runner.infrastructure-failure-001.log"
+            if source.is_file() and not target.exists():
+                shutil.copy2(source, target)
+                archived_logs.append(str(target))
+        recovery_history.append({
+            "detected_utc": _utc_now(),
+            "previous_active_process": active or None,
+            "failure_class": "INFRASTRUCTURE_FAILURE",
+            "archived_logs": archived_logs,
+        })
+        update_stage(
+            root,
+            stage_name,
+            status="FAIL",
+            active_process=None,
+            failure_class="INFRASTRUCTURE_FAILURE",
+            recovery_history=recovery_history,
+        )
+        events.append({"stage": stage, "action": "recover_orphan_once"})
+    result = run_vasp_stage(root, stage, execute=True)
+    events.append({"stage": stage, "action": "execute", "passed": result.get("passed")})
+    if not result.get("passed"):
+        raise WorkflowBlocked(f"{stage} 未通过完整性/收敛检查。")
+
+
+def run_workflow(run_dir: str | Path, *, execute: bool = False, until: str = "export") -> dict[str, Any]:
+    root = Path(run_dir).expanduser().resolve()
+    if until not in WORKFLOW_STOPS:
+        raise ValueError(f"until 必须是：{', '.join(WORKFLOW_STOPS)}")
+    if not execute:
+        return {"mode": "DRY_RUN", **inspect_workflow(root), "until": until}
+    config = _load_snapshot(root)
+    events: list[dict[str, Any]] = []
+    try:
+        with RunLock(root):
+            if _stage_status(root, "validate") != "PASS":
+                raise WorkflowBlocked("输入尚未通过 prepare/哈希校验，不能启动科学计算。")
+            _ensure_vasp_stage(root, "scf", events)
+            if until == "scf":
+                raise StopIteration
+            _ensure_vasp_stage(root, "band", events)
+            if until == "band":
+                raise StopIteration
+
+            if _stage_status(root, "candidates") != "PASS":
+                generate_candidates(root)
+                events.append({"stage": "candidates", "action": "generated"})
+            else:
+                events.append({"stage": "candidates", "action": "skip_passed"})
+            if until == "candidates":
+                raise StopIteration
+
+            attempt_plan = root / "03_candidates/attempt-plan.json"
+            if not attempt_plan.is_file():
+                create_attempts(root)
+                events.append({"stage": "wannier", "action": "planned_attempts"})
+            spec = read_json(root / "03_candidates/candidate-spec.json")
+            candidate_results = []
+            for structures, candidate in _candidate_layout(config, spec):
+                result = _process_candidate(root, structures, candidate)
+                candidate_results.append({"structures": structures, **result})
+            coverage = _accepted_coverage(root, config, spec)
+            if not coverage["passed"]:
+                update_stage(root, "04_wannier", status="FAIL", finished_utc=_utc_now(), outputs=candidate_results)
+                raise WorkflowBlocked("有限候选/能窗尝试结束后仍没有覆盖全部结构的合格 Wannier 表示。")
+            update_stage(root, "04_wannier", status="PASS", finished_utc=_utc_now(), outputs=candidate_results)
+            update_stage(root, "05_quality", status="PASS", finished_utc=_utc_now(), outputs=[coverage])
+            events.append({"stage": "wannier", "action": "finite_search_complete", "coverage": coverage})
+            if until in {"wannier", "quality"}:
+                raise StopIteration
+
+            if _stage_status(root, "rank") != "PASS":
+                ranking = rank_attempts(root)
+                update_stage(root, "06_rank", status="PASS", finished_utc=_utc_now(), outputs=[ranking["ranking"]])
+                events.append({"stage": "rank", "action": "ranked", "ranking": ranking["ranking"]})
+            else:
+                events.append({"stage": "rank", "action": "skip_passed"})
+            if until == "rank":
+                raise StopIteration
+
+            if _stage_status(root, "export") != "PASS":
+                exported = export_ranked_attempts(root)
+                update_stage(root, "07_export", status="PASS", finished_utc=_utc_now(), outputs=[exported["export"]])
+                events.append({"stage": "export", "action": "exported", "path": exported["export"]})
+            else:
+                events.append({"stage": "export", "action": "skip_passed"})
+    except StopIteration:
+        pass
+    except (WorkflowBlocked, OSError, PermissionError, ValueError, json.JSONDecodeError) as exc:
+        summary = {
+            "schema_version": 1,
+            "updated_utc": _utc_now(),
+            "status": "BLOCKED",
+            "reason": str(exc),
+            "error_type": type(exc).__name__,
+            "events": events,
+            "workflow": inspect_workflow(root),
+        }
+        atomic_json(root / "workflow-summary.json", summary)
+        return {"passed": False, **summary}
+
+    passed = all(
+        _stage_status(root, name) == "PASS"
+        for name in WORKFLOW_STOPS[: WORKFLOW_STOPS.index(until) + 1]
+    )
+    summary = {
+        "schema_version": 1,
+        "updated_utc": _utc_now(),
+        "status": "PASS" if passed else "INCOMPLETE",
+        "until": until,
+        "events": events,
+        "workflow": inspect_workflow(root),
+    }
+    atomic_json(root / "workflow-summary.json", summary)
+    return {"passed": passed, **summary}

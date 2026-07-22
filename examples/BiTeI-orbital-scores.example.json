@@ -1,0 +1,12 @@
+{
+  "element_counts": {"Bi": 1, "Te": 1, "I": 1},
+  "orbital_scores": {
+    "Bi:s": 0.06,
+    "Bi:p": 0.40,
+    "Te:s": 0.03,
+    "Te:p": 0.30,
+    "I:s": 0.01,
+    "I:p": 0.20
+  },
+  "chemical_valence": ["Bi:p", "Te:p", "I:p"]
+}

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "fixture_set": "synthetic-unit-v1",
+  "redistribution": "repository-owned synthetic data",
+  "scientific_use": false,
+  "contains_vasp_potcar": false,
+  "contains_unpublished_results": false,
+  "fixtures": [
+    {
+      "path": "project",
+      "purpose": "configuration, state-machine, and dry-run tests",
+      "origin": "synthetic"
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+schema_version: 0.1
+project: synthetic_pair_demo
+
+ensemble:
+  mode: common_basis
+
+structures:
+  - id: L1
+    poscar: POSCAR.L1
+  - id: L2
+    poscar: POSCAR.L2
+
+physics:
+  soc: true
+  dimensionality: 2
+  axes: [x, y, z]
+  target_energy_eV: [-2.0, 3.5]
+
+pseudopotentials:
+  lock: POTCAR_LOCK.synthetic.json
+  set: SYNTHETIC_NOT_EXECUTABLE
+
+backend:
+  kind: dry_run_only
+  vasp: ncl
+  mpi_processes: 2
+
+meshes:
+  scf: [3, 3, 1]
+  screening: [3, 3, 1]
+  production: [5, 5, 1]
+
+candidates:
+  policy: deterministic_nested
+  max_candidates: 4
+  same_basis_across_structures: true
+  allow_exact: true
+  allow_disentanglement: true
+
+iteration:
+  max_window_attempts_per_candidate: 2
+  max_localization_retries: 1
+  never_overwrite: true
+
+ranking:
+  pair_reduce: worst_case
+  output_top_k: 2
+  hard_gates:
+    rmse_meV: 20.0
+    p95_meV: 50.0
+    max_meV: 120.0
+    gap_error_meV: 30.0
