@@ -45,6 +45,27 @@ PYTHONPATH=src python3 -m w90flow init ../03_自动化架构/configs/pair-exampl
 
 ## 实际执行（v0.6）
 
+### 项目验收主入口：优化好的 POSCAR → Stage-1 Top-K
+
+`stage1-coldstart` 是当前项目的核心入口。一个 YAML 同时冻结 SCF/Band 前处理和
+Wannier 有限候选合同；程序会保存唯一 preprocess run 和唯一 Wannier run 指针，
+中断后只恢复同一个目录，不重复创建作业。
+
+```bash
+PYTHONPATH=src python3 -m w90flow stage1-coldstart /path/to/stage1.yaml \
+  --campaign-dir /path/to/campaign-state
+
+# 复核 dry-run 后才执行；重复这条命令就是断点续跑
+PYTHONPATH=src python3 -m w90flow stage1-coldstart /path/to/stage1.yaml \
+  --campaign-dir /path/to/campaign-state \
+  --runs-root /private/tmp/LocalVASP-mount/runs/w90flow \
+  --execute
+```
+
+签名状态锁定 YAML、POSCAR、SCF/Band/Wannier 模板和 POTCAR lock 的 SHA256。
+完成 Band 后，所有有限的投影候选都会进入真实 Wannier 门槛；某个投影在第一个
+合格能窗后停止它自身的冗余窗口尝试，其他投影仍继续验收。Stage 2 不在该命令中。
+
 ### 第一优先入口：从已有 SCF/Band 开始自动拟合
 
 现阶段最稳定的入口是不重复电子结构，而是导入输入哈希一致的 SCF/Band 目录后自动完成候选、有限 attempts、质量、排名和 top-K：
@@ -195,8 +216,9 @@ v1.0 的冻结范围、输入/输出、有限重试表和验收门槛见 [AUTOMA
 
 下一步只收敛 v1.0：完成可执行 preprocess 状态机、对 PyW90 完整壳层与
 `px/py/pz` 分量建议做真实 attempt 回归，并完成 BiTeI/InSe/PtO2 的盲输入回放和
-一次全新材料冷启动。下游 shift-current/SHG 保持为独立私有模块，只消费 Stage-1
-通过硬门槛的 top-K 包。
+全新材料冷启动。BiTeI/InSe/PtO2 回归已完成；SiS₂ nSOC 与 MoOS SOC 是已冻结的
+真正外部冷启动。下游 shift-current/SHG 保持为独立私有模块，只消费 Stage-1
+通过硬门槛的 top-K 包，不是 Stage-1 v1.0 的通过条件。
 
 ## 科学边界
 

@@ -123,7 +123,12 @@ def _read_snapshot(run_dir: Path) -> dict[str, Any]:
     return data
 
 
-def prepare_run(config: dict[str, Any], runs_root: str | Path) -> Path:
+def prepare_run(
+    config: dict[str, Any],
+    runs_root: str | Path,
+    *,
+    run_dir: str | Path | None = None,
+) -> Path:
     band_path_mode = config.get("band_path", {}).get("mode", "template")
     if band_path_mode in {"vaspkit", "both"}:
         raise ValueError(
@@ -145,7 +150,7 @@ def prepare_run(config: dict[str, Any], runs_root: str | Path) -> Path:
     if not pseudo_default and any(not item.get("pseudopotential_set") for item in config["structures"]):
         raise ValueError("每个结构或 pseudopotentials 必须指定 set。")
 
-    run_dir = initialize_run(config, runs_root)
+    run_dir = initialize_run(config, runs_root, run_dir=run_dir)
     manifests: list[dict[str, Any]] = []
     for structure in config["structures"]:
         sid = str(structure["id"])
@@ -183,7 +188,11 @@ def prepare_run(config: dict[str, Any], runs_root: str | Path) -> Path:
             _write_exact_text(directory / "INCAR", incar_text)
 
             resolved_mesh = structure.get("meshes_resolved", {}).get(short_stage)
-            if short_stage == "band" and band_path is not None:
+            preserve_precomputed = bool(structure.get("preserve_precomputed_inputs"))
+            if preserve_precomputed and short_stage in {"scf", "band"}:
+                _copy_exact(Path(templates["kpoints_resolved"]), directory / "KPOINTS")
+                generated_inputs[f"{short_stage}_kpoints"] = "preserved_precomputed_handoff"
+            elif short_stage == "band" and band_path is not None:
                 _write_exact_text(directory / "KPOINTS", band_path["kpoints_text"])
                 generated_inputs["band_kpoints"] = "native_ase_path"
             elif short_stage in {"scf", "wannier"} and resolved_mesh:

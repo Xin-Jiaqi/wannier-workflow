@@ -506,6 +506,18 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(len(statuses), 8)
             self.assertTrue(all(item["status"] == "PENDING" for item in statuses))
 
+    def test_explicit_run_dir_is_unique_and_must_stay_inside_runs_root(self) -> None:
+        config = load_project(CONFIG)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "runs"
+            fixed = root / "deterministic-coldstart"
+            run = initialize_run(config, root, run_dir=fixed)
+            self.assertEqual(run, fixed.resolve())
+            with self.assertRaises(FileExistsError):
+                initialize_run(config, root, run_dir=fixed)
+            with self.assertRaises(ValueError):
+                initialize_run(config, root, run_dir=Path(temporary) / "outside")
+
     def test_fit_from_bands_dry_run_is_single_entrypoint(self) -> None:
         config = load_project(CONFIG)
         result = fit_from_precomputed(
@@ -517,6 +529,18 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertEqual(result["mode"], "DRY_RUN")
         self.assertIn("CHGCAR", result["contract"]["band_required"])
+
+    def test_fit_from_bands_rejects_execute_and_bootstrap_together(self) -> None:
+        config = load_project(CONFIG)
+        with self.assertRaises(ValueError):
+            fit_from_precomputed(
+                config,
+                "unused",
+                {"L1": "/scf/L1", "L2": "/scf/L2"},
+                {"L1": "/band/L1", "L2": "/band/L2"},
+                execute=True,
+                bootstrap_only=True,
+            )
 
     @unittest.skipUnless(HAS_REFERENCE_FIXTURES, "set W90FLOW_REFERENCE_ROOT for prepublication reference fixtures")
     def test_all_reference_examples(self) -> None:

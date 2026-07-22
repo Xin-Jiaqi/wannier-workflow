@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import ConfigError, load_project
+from .coldstart import run_stage1_coldstart
 from .attempts import create_attempts, import_completed_attempt, run_attempt
 from .candidates import suggest_projection_candidates
 from .executor import finalize_run, generate_candidates, import_completed_stage, prepare_run, reconcile_stage, run_vasp_stage
@@ -133,6 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fit_preprocess.add_argument("config")
     fit_preprocess.add_argument("--runs-root", default="runs")
+    fit_preprocess.add_argument("--run-dir", help="可选的确定性唯一 run 路径；必须位于 runs-root 内")
     fit_preprocess.add_argument(
         "--preprocess-source",
         action="append",
@@ -140,7 +142,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="STRUCTURE=/absolute/preprocess-run",
     )
     fit_preprocess.add_argument("--until", choices=WORKFLOW_STOPS, default="export")
-    fit_preprocess.add_argument("--execute", action="store_true")
+    fit_preprocess_mode = fit_preprocess.add_mutually_exclusive_group()
+    fit_preprocess_mode.add_argument("--execute", action="store_true")
+    fit_preprocess_mode.add_argument(
+        "--bootstrap-only",
+        action="store_true",
+        help="只创建一次 Wannier run 并导入 SCF/Band；随后必须 resume 同一 run_dir",
+    )
+
+    coldstart = sub.add_parser(
+        "stage1-coldstart",
+        help="从优化好的 POSCAR 无人值守推进 SCF/Band/有限 Wannier 候选/Top-K",
+    )
+    coldstart.add_argument("config")
+    coldstart.add_argument("--campaign-dir", required=True)
+    coldstart.add_argument("--runs-root", default="/private/tmp/LocalVASP-mount/runs/w90flow")
+    coldstart.add_argument("--poll-seconds", type=float, default=30.0)
+    coldstart.add_argument("--execute", action="store_true")
 
     inspect = sub.add_parser("inspect", help="只读显示自动状态机的下一动作")
     inspect.add_argument("run_dir")
@@ -352,10 +370,22 @@ def main(argv: list[str] | None = None) -> int:
                 args.runs_root,
                 _source_mappings(args.preprocess_source),
                 execute=args.execute,
+                bootstrap_only=args.bootstrap_only,
+                run_dir=args.run_dir,
                 until=args.until,
             )
             _emit(result)
             return 0 if result.get("passed") or not args.execute else 1
+        elif args.command == "stage1-coldstart":
+            result = run_stage1_coldstart(
+                args.config,
+                args.campaign_dir,
+                args.runs_root,
+                execute=args.execute,
+                poll_seconds=args.poll_seconds,
+            )
+            _emit(result)
+            return 0 if (not args.execute or result.get("status") == "COMPLETE") else 1
         elif args.command == "audit-ranking":
             with Path(args.ranking_json).open("r", encoding="utf-8") as handle:
                 result = audit_ranking_document(json.load(handle))

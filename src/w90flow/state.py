@@ -57,14 +57,28 @@ def update_stage(run_dir: str | Path, stage: str, **changes: Any) -> dict[str, A
     return state
 
 
-def initialize_run(config: dict[str, Any], runs_root: str | Path) -> Path:
+def initialize_run(
+    config: dict[str, Any],
+    runs_root: str | Path,
+    *,
+    run_dir: str | Path | None = None,
+) -> Path:
     snapshot = public_snapshot(config)
     canonical = json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode("utf-8")
     config_hash = hashlib.sha256(canonical).hexdigest()
     suffix = config_hash[:8]
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_dir = Path(runs_root).expanduser().resolve() / f"{config['project']}-{stamp}-{suffix}"
-    run_dir.mkdir(parents=True, exist_ok=False)
+    root = Path(runs_root).expanduser().resolve()
+    if run_dir is None:
+        target = root / f"{config['project']}-{stamp}-{suffix}"
+    else:
+        target = Path(run_dir).expanduser().resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("explicit run_dir 必须位于 runs_root 内。") from exc
+    target.mkdir(parents=True, exist_ok=False)
+    run_dir = target
 
     with (run_dir / "project.snapshot.yaml").open("w", encoding="utf-8") as handle:
         yaml.safe_dump(snapshot, handle, allow_unicode=True, sort_keys=False)

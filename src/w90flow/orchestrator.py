@@ -152,9 +152,13 @@ def fit_from_precomputed(
     band_sources: dict[str, str | Path],
     *,
     execute: bool = False,
+    bootstrap_only: bool = False,
+    run_dir: str | Path | None = None,
     until: str = "export",
 ) -> dict[str, Any]:
     """Bootstrap the deterministic Wannier search from verified SCF/Band data."""
+    if execute and bootstrap_only:
+        raise ValueError("execute 与 bootstrap_only 不能同时启用。")
     expected = {str(item["id"]) for item in config["structures"]}
     if set(scf_sources) != expected or set(band_sources) != expected:
         raise ValueError("SCF/Band source 映射必须恰好覆盖 project 中的全部结构。")
@@ -164,7 +168,7 @@ def fit_from_precomputed(
         "hash_policy": "SCF verifies four prepared inputs; Band additionally verifies CHGCAR",
         "next": "candidate generation -> finite Wannier attempts -> quality -> rank -> export",
     }
-    if not execute:
+    if not execute and not bootstrap_only:
         return {
             "mode": "DRY_RUN",
             "project": config["project"],
@@ -173,9 +177,19 @@ def fit_from_precomputed(
             "scf_sources": {key: str(value) for key, value in scf_sources.items()},
             "band_sources": {key: str(value) for key, value in band_sources.items()},
         }
-    run = prepare_run(config, runs_root)
+    run = prepare_run(config, runs_root, run_dir=run_dir)
     scf_import = import_completed_stage(run, "scf", scf_sources)
     band_import = import_completed_stage(run, "band", band_sources)
+    if bootstrap_only:
+        return {
+            "mode": "BOOTSTRAPPED",
+            "run_dir": str(run),
+            "contract": contract,
+            "scf_import": scf_import,
+            "band_import": band_import,
+            "passed": False,
+            "next": "persist run_dir, then resume this exact run with --execute",
+        }
     result = run_workflow(run, execute=True, until=until)
     return {
         "run_dir": str(run),
@@ -193,6 +207,8 @@ def fit_from_preprocess(
     preprocess_sources: dict[str, str | Path],
     *,
     execute: bool = False,
+    bootstrap_only: bool = False,
+    run_dir: str | Path | None = None,
     until: str = "export",
 ) -> dict[str, Any]:
     """Verify completed preprocess handoffs and enter the Wannier state machine.
@@ -237,6 +253,9 @@ def fit_from_preprocess(
         analysis = resolve_periodicity(parsed, rebound["physics"])
         structure["poscar_resolved"] = str(optimized)
         structure["structure_analysis"] = analysis
+        # SCF/Band are immutable, hash-verified handoffs.  Their exact KPOINTS
+        # must be copied instead of regenerated from an equivalent mesh.
+        structure["preserve_precomputed_inputs"] = True
         dimensions.add(int(analysis["dimensionality"]))
         meshes = rebound.get("meshes", {})
         resolved_meshes: dict[str, list[int]] = {}
@@ -273,6 +292,8 @@ def fit_from_preprocess(
         scf_sources,
         band_sources,
         execute=execute,
+        bootstrap_only=bootstrap_only,
+        run_dir=run_dir,
         until=until,
     )
     return {**result, "preprocess_handoffs": handoffs}

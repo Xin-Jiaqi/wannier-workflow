@@ -405,6 +405,7 @@ root = Path.cwd()
 stage = sys.argv[1]
 if stage == "02_scf":
     (root / "CHGCAR").write_text("synthetic charge\\n", encoding="utf-8")
+    (root / "EIGENVAL").write_text("header\\nheader\\nheader\\nheader\\nheader\\n2 1 2\\n\\n0 0 0 1\\n1 -1.0\\n2 1.0\\n", encoding="utf-8")
     (root / "OSZICAR").write_text(" DAV: 1 -1 0.1\\n DAV: 2 -1.1 0.001\\n 1 F= -1.1 E0= -1.1 d E=0\\n", encoding="utf-8")
     (root / "OUTCAR").write_text(" EDIFF = 1.0E-6\\n NELM = 80\\n LSORBIT = T\\n NSW = 0\\n aborting loop because EDIFF is reached\\n General timing and accounting informations for this job:\\n", encoding="utf-8")
 elif stage == "03_band":
@@ -432,6 +433,28 @@ else:
             self.assertEqual(set(handoff["files"]), {"POSCAR", "OUTCAR", "EIGENVAL", "PROCAR", "vasprun.xml"})
             self.assertEqual(len(result["history"]), 2)
 
+            registry = root / "registry"
+            (registry / "X").mkdir(parents=True)
+            potcar_payload = (run / "02_scf/POTCAR").read_bytes()
+            (registry / "X/POTCAR").write_bytes(potcar_payload)
+            potcar_sha = hashlib.sha256(potcar_payload).hexdigest()
+            lock_path = root / "POTCAR_LOCK.json"
+            lock_path.write_text(json.dumps({
+                "registry": str(registry),
+                "sets": {
+                    "SYNTHETIC_X": {
+                        "order": ["X"],
+                        "component_sha256": {"X": potcar_sha},
+                        "combined_sha256": potcar_sha,
+                    }
+                },
+            }), encoding="utf-8")
+            wannier_incar = root / "INCAR.wannier"
+            wannier_incar.write_text(
+                'LWANNIER90 = .TRUE.\nWANNIER90_WIN = "\nmp_grid = 3 3 1\nnum_wann = 1\nnum_bands = 2\n"\n',
+                encoding="utf-8",
+            )
+
             stage1 = {
                 "project": "synthetic-handoff",
                 "structures": [{"id": "X", "poscar_resolved": str(run / "02_scf/POSCAR")}],
@@ -440,11 +463,16 @@ else:
                 "ranking": {"output_top_k": 1},
                 "candidates": {"max_candidates": 1},
                 "ensemble": {"mode": "independent"},
-                "meshes": {"scf": [3, 3, 1], "wannier": [3, 3, 1]},
+                "meshes": {"scf": [1, 1, 1], "wannier": [1, 1, 1]},
+                "pseudopotentials": {
+                    "set": "SYNTHETIC_X",
+                    "lock_resolved": str(lock_path),
+                    "registry": str(registry),
+                },
                 "templates": {
                     "scf": {},
                     "band": {},
-                    "wannier": {"incar_resolved": str(run / "02_scf/INCAR"), "kpoints_resolved": str(run / "02_scf/KPOINTS")},
+                    "wannier": {"incar_resolved": str(wannier_incar), "kpoints_resolved": str(run / "02_scf/KPOINTS")},
                 },
             }
             handoff_preview = fit_from_preprocess(
@@ -455,6 +483,19 @@ else:
             )
             self.assertEqual(handoff_preview["mode"], "DRY_RUN")
             self.assertEqual(handoff_preview["preprocess_handoffs"]["X"]["structure_analysis"]["dimensionality"], 2)
+
+            bootstrapped = fit_from_preprocess(
+                stage1,
+                root / "wannier-runs",
+                {"X": run},
+                bootstrap_only=True,
+            )
+            self.assertEqual(bootstrapped["mode"], "BOOTSTRAPPED")
+            exact_run = Path(bootstrapped["run_dir"])
+            self.assertTrue(exact_run.is_dir())
+            self.assertEqual(read_json(exact_run / "01_scf/stage.json")["status"], "PASS")
+            self.assertEqual(read_json(exact_run / "02_band/stage.json")["status"], "PASS")
+            self.assertEqual(read_json(exact_run / "03_candidates/stage.json")["status"], "PENDING")
 
     def test_lock_refuses_duplicate_and_pass_refuses_resubmit(self) -> None:
         config = normalize_preprocess_config(base_document(relaxation=False), 2)
