@@ -565,6 +565,19 @@ def _fit_sort_key(item: dict[str, Any]) -> tuple[float, float, float, float, int
     )
 
 
+def _best_attempt_per_candidate(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one best passing window/localization attempt per projection candidate."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in results:
+        if item.get("passed"):
+            grouped.setdefault(str(item["candidate"]), []).append(item)
+    selected = []
+    for candidate in sorted(grouped):
+        attempts = sorted(grouped[candidate], key=_fit_sort_key)
+        selected.append(attempts[0])
+    return selected
+
+
 def _common_attempt_ranking(
     results_by_structure: dict[str, list[dict[str, Any]]],
     structure_ids: list[str],
@@ -712,7 +725,7 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
                 "candidate_family": metadata.get("candidate_family"),
                 "integrated_weight_fraction": metadata.get("integrated_weight_fraction"),
             })
-        accepted = [item for item in results if item["passed"]]
+        accepted = _best_attempt_per_candidate(results)
         accepted.sort(key=_fit_sort_key)
         for rank, item in enumerate(accepted, 1):
             item["rank"] = rank

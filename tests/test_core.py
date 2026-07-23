@@ -16,7 +16,7 @@ from w90flow.dataset import make_attempt_record
 from w90flow.material_pool import screen_c2db
 from w90flow.orchestrator import RunLock, WorkflowBlocked, choose_retry_reason, fit_from_precomputed, group_has_runnable_member, inspect_workflow, run_workflow
 from w90flow.parsers import parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_procar_orbital_scores
-from w90flow.quality import IncompleteTargetSubspace, _best_contiguous_w90_slice, _common_attempt_ranking, _is_complete_sp, band_metrics, export_ranked_attempts
+from w90flow.quality import IncompleteTargetSubspace, _best_attempt_per_candidate, _best_contiguous_w90_slice, _common_attempt_ranking, _is_complete_sp, band_metrics, export_ranked_attempts
 from w90flow.pipeline import audit_reference, plan_project
 from w90flow.pyw90_adapter import element_projection_envelope, parse_eig_suggest_output, parse_pre_dos_output
 from w90flow.ranking import Thresholds, audit_ranking_document, rank_common_candidates
@@ -422,6 +422,31 @@ class CandidateTests(unittest.TestCase):
 
 
 class RankingTests(unittest.TestCase):
+    def test_independent_ranking_keeps_only_best_attempt_per_projection_candidate(self) -> None:
+        def item(candidate: str, attempt: str, p95: float) -> dict:
+            return {
+                "candidate": candidate,
+                "attempt": attempt,
+                "passed": True,
+                "num_wann": 8,
+                "metrics": {
+                    "mae_mev": 1.0,
+                    "rmse_mev": 2.0,
+                    "p95_mev": p95,
+                    "max_mev": 5.0,
+                },
+            }
+
+        selected = _best_attempt_per_candidate([
+            item("complete-sp", "attempt-001", 5.0),
+            item("complete-sp", "attempt-002", 3.0),
+            item("p-only", "attempt-001", 4.0),
+        ])
+        self.assertEqual(
+            {(entry["candidate"], entry["attempt"]) for entry in selected},
+            {("complete-sp", "attempt-002"), ("p-only", "attempt-001")},
+        )
+
     def test_declared_target_window_excludes_outside_band_segments_from_fit_error(self) -> None:
         dft = [
             [(0.0, -1.0), (1.0, -0.8)],
