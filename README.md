@@ -228,7 +228,8 @@ v1.0 的冻结范围、输入/输出、有限重试表和验收门槛见 [AUTOMA
 `px/py/pz` 分量建议做真实 attempt 回归，并完成 BiTeI/InSe/PtO2 的盲输入回放和
 全新材料冷启动。BiTeI/InSe/PtO2 回归已完成；SiS₂ 和 MoOS 均因首次运行促成
 通用修正而归入开发集，MoOS v2 已完成、SiS₂ 有限搜索后科学性阻塞。代码与协议
-冻结后，AsClS SOC 作为下一位真正未见样本运行。下游 shift-current/SHG 保持为独立私有模块，只消费 Stage-1
+冻结后，AsClS SOC 已作为第一项真正未见样本完成并给出三套合格模型；GeS2 与 MoSSe
+现以同一冻结代码分别检验不同层群和 d-p 杂化。下游 shift-current/SHG 保持为独立私有模块，只消费 Stage-1
 通过硬门槛的 top-K 包，不是 Stage-1 v1.0 的通过条件。
 
 ## 科学边界
