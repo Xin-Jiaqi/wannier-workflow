@@ -117,18 +117,35 @@ def band_metrics(
     dft_blocks: list[list[tuple[float, float]]],
     w90_blocks: list[list[tuple[float, float]]],
     occupied_count: int,
-) -> tuple[dict[str, float], list[list[float]]]:
+    *,
+    error_energy_window_eV: tuple[float, float] | None = None,
+) -> tuple[dict[str, Any], list[list[float]]]:
     if len(dft_blocks) != len(w90_blocks):
         raise ValueError("DFT/Wannier 能带数不同。")
     if not 0 < occupied_count < len(dft_blocks):
         raise ValueError("占据带数不在比较能带范围内。")
+    if (
+        error_energy_window_eV is not None
+        and error_energy_window_eV[0] >= error_energy_window_eV[1]
+    ):
+        raise ValueError("误差统计能量窗口必须递增。")
     errors_mev: list[float] = []
     interpolated: list[list[float]] = []
+    excluded_point_count = 0
     for dft, w90 in zip(dft_blocks, w90_blocks):
         targets = [point[0] for point in dft]
         values = _interpolate(w90, targets)
         interpolated.append(values)
-        errors_mev.extend(1000.0 * (w90_energy - dft_point[1]) for w90_energy, dft_point in zip(values, dft))
+        for w90_energy, dft_point in zip(values, dft):
+            if (
+                error_energy_window_eV is not None
+                and not error_energy_window_eV[0] <= dft_point[1] <= error_energy_window_eV[1]
+            ):
+                excluded_point_count += 1
+                continue
+            errors_mev.append(1000.0 * (w90_energy - dft_point[1]))
+    if not errors_mev:
+        raise ValueError("声明的目标能量窗口内没有可比较的 DFT 能带点。")
     absolute = [abs(value) for value in errors_mev]
     dft_valence = max(point[1] for band in dft_blocks[:occupied_count] for point in band)
     dft_conduction = min(point[1] for band in dft_blocks[occupied_count:] for point in band)
@@ -142,6 +159,13 @@ def band_metrics(
         "dft_indirect_gap_ev": dft_conduction - dft_valence,
         "w90_indirect_gap_ev": w90_conduction - w90_valence,
         "gap_error_mev": 1000.0 * ((w90_conduction - w90_valence) - (dft_conduction - dft_valence)),
+        "compared_point_count": len(errors_mev),
+        "excluded_point_count": excluded_point_count,
+        "error_energy_window_eV": (
+            list(error_energy_window_eV)
+            if error_energy_window_eV is not None
+            else None
+        ),
     }
     return metrics, interpolated
 
@@ -196,7 +220,8 @@ def _plot_comparison(
     w90: list[list[tuple[float, float]]],
     fermi: float,
     title: str,
-    metrics: dict[str, float],
+    metrics: dict[str, Any],
+    display_energy_window_eV: tuple[float, float] | None = None,
 ) -> None:
     cache = Path("/private/tmp/LocalVASP-mount/cache/w90flow-matplotlib")
     if not cache.parent.is_dir():
@@ -215,6 +240,8 @@ def _plot_comparison(
     ax.axhline(0.0, color="#777777", lw=0.8, ls=":")
     ax.set_xlabel("k path")
     ax.set_ylabel(r"Energy $-E_F$ (eV)")
+    if display_energy_window_eV is not None:
+        ax.set_ylim(*display_energy_window_eV)
     ax.set_title(title)
     ax.legend(frameon=False)
     ax.text(0.98, 0.02, f"MAE {metrics['mae_mev']:.3f} meV\nP95 {metrics['p95_mev']:.3f} meV\nmax {metrics['max_mev']:.3f} meV", transform=ax.transAxes, ha="right", va="bottom")
@@ -326,13 +353,20 @@ def _best_contiguous_w90_slice(
     dft: list[list[tuple[float, float]]],
     w90: list[list[tuple[float, float]]],
     occupied_count: int,
-) -> tuple[int, dict[str, float]]:
+    *,
+    error_energy_window_eV: tuple[float, float] | None = None,
+) -> tuple[int, dict[str, Any]]:
     """Map a disentangled model to the target bands without manual band labels."""
     if len(dft) > len(w90):
         raise IncompleteTargetSubspace(len(dft), len(w90))
-    ranked: list[tuple[tuple[float, float, float], int, dict[str, float]]] = []
+    ranked: list[tuple[tuple[float, float, float], int, dict[str, Any]]] = []
     for start in range(len(w90) - len(dft) + 1):
-        metrics, _ = band_metrics(dft, w90[start:start + len(dft)], occupied_count)
+        metrics, _ = band_metrics(
+            dft,
+            w90[start:start + len(dft)],
+            occupied_count,
+            error_energy_window_eV=error_energy_window_eV,
+        )
         ranked.append(((metrics["rmse_mev"], metrics["p95_mev"], metrics["max_mev"]), start, metrics))
     _, start, metrics = min(ranked, key=lambda item: item[0])
     return start, metrics
@@ -362,6 +396,21 @@ def evaluate_attempt(
     poscar = parse_poscar(base / "00_input/POSCAR")
     dft_all = dft_band_blocks(eig, poscar["lattice_angstrom"])
     w90_all = read_w90_band_blocks(directory / "wannier90_band.dat")
+    fermi = parse_fermi_outcar(base / "01_scf/OUTCAR")
+    target_window_declared = tuple(float(value) for value in config["physics"]["target_energy_eV"])
+    energy_reference = str(config["physics"].get("energy_reference", "absolute"))
+    if energy_reference == "fermi_relative":
+        target_window_absolute = (
+            fermi + target_window_declared[0],
+            fermi + target_window_declared[1],
+        )
+        display_energy_window = target_window_declared
+    else:
+        target_window_absolute = target_window_declared
+        display_energy_window = (
+            target_window_declared[0] - fermi,
+            target_window_declared[1] - fermi,
+        )
     target_indices = list(record["plan"]["target_bands_1_based"])
     dft_target = [dft_all[index - 1] for index in target_indices]
     soc = bool(config["physics"].get("soc"))
@@ -386,9 +435,19 @@ def evaluate_attempt(
             "retained_vasp_bands_1_based": retained,
             "target_w90_bands_1_based": [index + 1 for index in model_indices],
         }
-        target_metrics, _ = band_metrics(dft_target, w90_target, target_occupied)
+        target_metrics, _ = band_metrics(
+            dft_target,
+            w90_target,
+            target_occupied,
+            error_energy_window_eV=target_window_absolute,
+        )
     else:
-        start, target_metrics = _best_contiguous_w90_slice(dft_target, w90_all, target_occupied)
+        start, target_metrics = _best_contiguous_w90_slice(
+            dft_target,
+            w90_all,
+            target_occupied,
+            error_energy_window_eV=target_window_absolute,
+        )
         w90_target = w90_all[start:start + len(dft_target)]
         model_offset = target_indices[0] - (start + 1)
         model_occupied = original_occupied - model_offset
@@ -414,9 +473,16 @@ def evaluate_attempt(
     if not passed:
         failure_class = "BAND_CONNECTIVITY_FAILED" if metric_checks["p95"] and not metric_checks["max"] else "QUALITY_GATE_FAILED"
 
-    fermi = parse_fermi_outcar(base / "01_scf/OUTCAR")
     plot = directory / "VASP_W90_cmp.pdf"
-    _plot_comparison(plot, dft_target, w90_target, fermi, f"{structure} / {candidate}", target_metrics)
+    _plot_comparison(
+        plot,
+        dft_target,
+        w90_target,
+        fermi,
+        f"{structure} / {candidate}",
+        target_metrics,
+        display_energy_window,
+    )
     projection = _parse_projections(directory / "wannier90.win")
     spread = wout["final_total_spread_ang2"]
     result = {
@@ -433,6 +499,13 @@ def evaluate_attempt(
         "nocc_target": target_occupied,
         "nocc_model": model_occupied,
         "fermi_eV": fermi,
+        "comparison_scope": {
+            "energy_reference": energy_reference,
+            "declared_target_energy_eV": list(target_window_declared),
+            "absolute_target_energy_eV": list(target_window_absolute),
+            "error_mask": "include points whose DFT energy lies inside the declared target window",
+            "gap_check": "indirect gap evaluated independently on the mapped target bands",
+        },
         "target_metrics": target_metrics,
         "native_model_metrics": native_metrics,
         "thresholds": thresholds,
