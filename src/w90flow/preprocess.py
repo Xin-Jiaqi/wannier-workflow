@@ -678,7 +678,12 @@ def patch_incar_contract(template_text: str, contract: Mapping[str, Any]) -> str
     return "\n".join(lines).rstrip() + "\n"
 
 
-def validate_incar_structure_compatibility(incar_text: str, atom_count: int) -> None:
+def validate_incar_structure_compatibility(
+    incar_text: str,
+    atom_count: int,
+    *,
+    require_soc_magmom: bool = False,
+) -> None:
     """Reject deterministic INCAR/POSCAR cardinality errors before VASP.
 
     VASP treats spin-orbit calculations as noncollinear.  If MAGMOM is
@@ -698,10 +703,15 @@ def validate_incar_structure_compatibility(incar_text: str, atom_count: int) -> 
     def enabled(value: str | None) -> bool:
         return value is not None and value.strip().upper() in {"T", ".T.", "TRUE", ".TRUE."}
 
-    if not (enabled(assignment("LSORBIT")) or enabled(assignment("LNONCOLLINEAR"))):
+    soc_enabled = enabled(assignment("LSORBIT")) or enabled(assignment("LNONCOLLINEAR"))
+    if not soc_enabled:
+        if require_soc_magmom:
+            raise PreprocessConfigError("要求 SOC/noncollinear 的模板没有启用 LSORBIT 或 LNONCOLLINEAR。")
         return
     magmom = assignment("MAGMOM")
     if magmom is None:
+        if require_soc_magmom:
+            raise PreprocessConfigError("SOC/noncollinear 模板必须显式给出 MAGMOM=3*NIONS 个分量。")
         return
     count = 0
     for token in magmom.replace(",", " ").split():
@@ -733,19 +743,13 @@ def _validate_command(command: Any, stage: str, stage_dir: Path) -> list[str]:
     return rendered
 
 
-def materialize_potcar_recipe(
+def _resolve_potcar_recipe(
     specification: Mapping[str, Any],
     elements: list[str],
-    destination: str | Path,
-) -> dict[str, Any]:
-    """Resolve an explicitly locked POTCAR path or ordered component recipe.
-
-    The manifest stores hashes and paths but never embeds POTCAR bytes.  Every
-    component needs an expected SHA256; there is no implicit local lookup.
-    """
+) -> tuple[dict[str, Any], bytes]:
+    """Read and validate a locked POTCAR recipe without writing its payload."""
     if not isinstance(specification, Mapping):
         raise PreprocessConfigError("potcar 必须显式给出锁定 path 或 components recipe。")
-    target = Path(destination)
     mode: str
     sources: list[dict[str, Any]] = []
     payload: bytes
@@ -794,13 +798,35 @@ def materialize_potcar_recipe(
             raise PreprocessConfigError("组合 POTCAR 的 combined_sha256 缺失或不匹配。")
         mode = "ordered_component_recipe"
     combined_sha256 = hashlib.sha256(payload).hexdigest()
-    _write_exact_bytes(target, payload)
-    return {
+    return ({
         "mode": mode,
         "element_order": elements,
         "combined_sha256": combined_sha256,
-        "destination": str(target),
         "sources": sources,
+    }, payload)
+
+
+def validate_potcar_recipe(
+    specification: Mapping[str, Any],
+    elements: list[str],
+) -> dict[str, Any]:
+    """Validate POTCAR order and hashes read-only; never persist licensed bytes."""
+    manifest, _payload = _resolve_potcar_recipe(specification, elements)
+    return manifest
+
+
+def materialize_potcar_recipe(
+    specification: Mapping[str, Any],
+    elements: list[str],
+    destination: str | Path,
+) -> dict[str, Any]:
+    """Validate and materialize an explicitly locked POTCAR recipe."""
+    target = Path(destination)
+    manifest, payload = _resolve_potcar_recipe(specification, elements)
+    _write_exact_bytes(target, payload)
+    return {
+        **manifest,
+        "destination": str(target),
     }
 
 

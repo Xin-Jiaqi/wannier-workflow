@@ -66,6 +66,14 @@ PYTHONPATH=src python3 -m w90flow stage1-coldstart /path/to/stage1.yaml \
 完成 Band 后，所有有限的投影候选都会进入真实 Wannier 门槛；某个投影在第一个
 合格能窗后停止它自身的冗余窗口尝试，其他投影仍继续验收。Stage 2 不在该命令中。
 
+默认 dry-run 也是完整、只读的提交前检查：它不会创建 campaign/run 或复制 POTCAR，
+但会读取真实 POTCAR 组件并核对 POSCAR 元素顺序、组件 SHA256、拼接 SHA256 及命名
+lock set；同时统一核对 `physics.soc`、SCF/Band 的 `preprocess.soc`、`backend.vasp`、
+各 launcher 参数中的 `std/ncl` 和 MPI 数。启用 SOC 的 SCF/Band（以及启用时的 Relax）
+模板必须显式提供恰好 `3*NIONS` 个 `MAGMOM` 分量。任一项不一致时，`--execute` 也会在
+启动 VASP 和创建 campaign 状态前失败。
+当前 launcher 合同要求命令参数列表的最后两项依次是 `std|ncl` 和正整数 MPI 数。
+
 ### 第一优先入口：从已有 SCF/Band 开始自动拟合
 
 现阶段最稳定的入口是不重复电子结构，而是导入输入哈希一致的 SCF/Band 目录后自动完成候选、有限 attempts、质量、排名和 top-K：

@@ -18,10 +18,14 @@ from .preprocess import (
     StageRecoveryRequired,
     inspect_preprocess_run,
     normalize_preprocess_config,
+    patch_incar_contract,
     prepare_preprocess_run,
     reconcile_preprocess_stage,
     recover_interrupted_stage,
     run_preprocess_workflow,
+    stage_incar_contract,
+    validate_incar_structure_compatibility,
+    validate_potcar_recipe,
 )
 from .state import atomic_json, read_json, sha256_file
 from .structure import resolve_periodicity
@@ -120,6 +124,168 @@ def _resolve_preprocess_inputs(config_path: Path, poscar: Path) -> tuple[dict[st
     return protocol, inputs
 
 
+def _positive_mpi_processes(value: Any, path: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{path} 必须是正整数。")
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{path} 必须是正整数。") from exc
+    if number <= 0 or str(number) != str(value).strip():
+        raise ValueError(f"{path} 必须是正整数。")
+    return number
+
+
+def _validate_execution_contract(
+    config: dict[str, Any],
+    protocol: dict[str, Any],
+    commands: dict[str, Any],
+) -> dict[str, Any]:
+    """Cross-check the scientific SOC switch against every local launcher."""
+    requested_soc = config.get("physics", {}).get("soc")
+    if not isinstance(requested_soc, bool):
+        raise ValueError("physics.soc 必须显式为 true/false。")
+    for stage in ("scf", "band"):
+        if protocol["soc"][stage] is not requested_soc:
+            raise ValueError(f"preprocess.soc.{stage} 与 physics.soc 不一致。")
+
+    expected_backend = "ncl" if requested_soc else "std"
+    backend = config.get("backend")
+    if not isinstance(backend, dict):
+        raise ValueError("backend 必须是对象。")
+    backend_vasp = str(backend.get("vasp", "")).strip().lower()
+    if backend_vasp != expected_backend:
+        raise ValueError(
+            f"physics.soc={str(requested_soc).lower()} 要求 backend.vasp={expected_backend}；"
+            f"当前为 {backend_vasp or '<missing>'}。"
+        )
+    mpi_processes = _positive_mpi_processes(backend.get("mpi_processes"), "backend.mpi_processes")
+
+    if not isinstance(commands, dict):
+        raise ValueError("preprocess_inputs.commands 必须是对象。")
+    active = ["02_scf", "03_band"]
+    if protocol["relaxation"]["enabled"]:
+        active.insert(0, "01_relax")
+    soc_keys = {"01_relax": "relaxation", "02_scf": "scf", "03_band": "band"}
+    checked: dict[str, Any] = {}
+    for stage in active:
+        command = commands.get(stage)
+        if not isinstance(command, list) or len(command) < 3 or any(not isinstance(item, str) for item in command):
+            raise ValueError(
+                f"preprocess_inputs.commands.{stage} 必须是参数列表，末两项依次为 std/ncl 与 MPI 数。"
+            )
+        command_vasp = command[-2].strip().lower()
+        expected_stage_vasp = "ncl" if protocol["soc"][soc_keys[stage]] else "std"
+        if command_vasp != expected_stage_vasp:
+            raise ValueError(
+                f"preprocess_inputs.commands.{stage} 应使用 {expected_stage_vasp}；当前为 {command_vasp}。"
+            )
+        command_mpi = _positive_mpi_processes(command[-1], f"preprocess_inputs.commands.{stage} MPI 数")
+        if command_mpi != mpi_processes:
+            raise ValueError(
+                f"preprocess_inputs.commands.{stage} MPI 数 {command_mpi} "
+                f"与 backend.mpi_processes={mpi_processes} 不一致。"
+            )
+        checked[stage] = {"vasp": command_vasp, "mpi_processes": command_mpi}
+    return {
+        "physics_soc": requested_soc,
+        "backend_vasp": backend_vasp,
+        "mpi_processes": mpi_processes,
+        "preprocess_commands": checked,
+    }
+
+
+def _validate_locked_potcar(
+    config: dict[str, Any],
+    structure: dict[str, Any],
+    elements: list[str],
+    recipe_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Require the read-only component recipe to equal the named project lock set."""
+    pseudo = config.get("pseudopotentials", {})
+    set_name = structure.get("pseudopotential_set", pseudo.get("set"))
+    if not isinstance(set_name, str) or not set_name:
+        raise ValueError("Stage-1 完整预检要求 pseudopotentials.set。")
+    lock_path = pseudo.get("lock_resolved")
+    if not isinstance(lock_path, str):
+        raise ValueError("Stage-1 完整预检要求 pseudopotentials.lock。")
+    lock = read_json(lock_path)
+    specification = (lock.get("sets") or {}).get(set_name)
+    if not isinstance(specification, dict):
+        raise ValueError(f"POTCAR lock 中没有 set：{set_name}")
+    order = specification.get("order")
+    if order != elements:
+        raise ValueError(f"POTCAR lock 顺序 {order} 与 POSCAR 元素顺序 {elements} 不一致。")
+    if recipe_manifest.get("mode") != "ordered_component_recipe":
+        raise ValueError("Stage-1 完整预检要求 ordered components recipe，不能只校验拼接后的 POTCAR。")
+    source_records = recipe_manifest.get("sources") or []
+    actual_components = {
+        item.get("element"): item.get("sha256")
+        for item in source_records
+        if isinstance(item, dict)
+    }
+    expected_components = specification.get("component_sha256")
+    if not isinstance(expected_components, dict) or actual_components != expected_components:
+        raise ValueError(f"preprocess POTCAR 组件哈希与 lock set {set_name} 不一致。")
+    expected_combined = specification.get("combined_sha256")
+    if recipe_manifest.get("combined_sha256") != expected_combined:
+        raise ValueError(f"preprocess POTCAR combined hash 与 lock set {set_name} 不一致。")
+    return {
+        "set": set_name,
+        "order": list(elements),
+        "component_sha256": actual_components,
+        "combined_sha256": expected_combined,
+    }
+
+
+def _validate_structure_preflight(
+    config: dict[str, Any],
+    structure: dict[str, Any],
+    poscar: Path,
+    protocol: dict[str, Any],
+    inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Perform the complete read-only gate used by dry-run and execute alike."""
+    execution = _validate_execution_contract(config, protocol, inputs["commands"])
+    parsed = parse_poscar(poscar)
+    atom_count = sum(parsed["counts"])
+    active = ["02_scf", "03_band"]
+    if protocol["relaxation"]["enabled"]:
+        active.insert(0, "01_relax")
+    soc_keys = {"01_relax": "relaxation", "02_scf": "scf", "03_band": "band"}
+    incar_checks: dict[str, Any] = {}
+    for stage in active:
+        specification = inputs["templates"].get(stage)
+        if not isinstance(specification, dict) or not isinstance(specification.get("incar"), str):
+            raise ValueError(f"preprocess_inputs.templates.{stage}.incar 缺失。")
+        source = Path(specification["incar"])
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        patched = patch_incar_contract(
+            source.read_text(encoding="utf-8", errors="strict"),
+            stage_incar_contract(protocol, stage),
+        )
+        stage_soc = bool(protocol["soc"][soc_keys[stage]])
+        validate_incar_structure_compatibility(
+            patched,
+            atom_count,
+            require_soc_magmom=stage_soc,
+        )
+        incar_checks[stage] = {
+            "soc": stage_soc,
+            "magmom_components": 3 * atom_count if stage_soc else None,
+        }
+
+    recipe = validate_potcar_recipe(inputs["potcar"], parsed["elements"])
+    potcar = _validate_locked_potcar(config, structure, parsed["elements"], recipe)
+    return {
+        "passed": True,
+        "execution": execution,
+        "incar": incar_checks,
+        "potcar": potcar,
+    }
+
+
 def plan_stage1_coldstart(config_path: str | Path, campaign_dir: str | Path, runs_root: str | Path) -> dict[str, Any]:
     config_file = Path(config_path).expanduser().resolve()
     campaign = Path(campaign_dir).expanduser().resolve()
@@ -136,6 +302,13 @@ def plan_stage1_coldstart(config_path: str | Path, campaign_dir: str | Path, run
     for structure in config["structures"]:
         poscar = Path(structure["poscar_resolved"])
         protocol, preprocess_inputs = _resolve_preprocess_inputs(config_file, poscar)
+        preflight = _validate_structure_preflight(
+            config,
+            structure,
+            poscar,
+            protocol,
+            preprocess_inputs,
+        )
         for stage, specification in preprocess_inputs["templates"].items():
             for role in ("incar", "kpoints"):
                 preprocess_templates[f"{stage}:{role}"] = sha256_file(specification[role])
@@ -145,6 +318,7 @@ def plan_stage1_coldstart(config_path: str | Path, campaign_dir: str | Path, run
             "poscar_sha256": sha256_file(poscar),
             "dimensionality": structure["structure_analysis"]["dimensionality"],
             "preprocess_protocol_sha256": protocol["protocol_sha256"],
+            "preflight": preflight,
         })
     return {
         "mode": "DRY_RUN",
@@ -159,6 +333,7 @@ def plan_stage1_coldstart(config_path: str | Path, campaign_dir: str | Path, run
             "preprocess_templates": preprocess_templates,
             "potcar_lock": sha256_file(config["pseudopotentials"]["lock_resolved"]),
         },
+        "preflight": {"passed": True, "execution": "NOT_STARTED"},
         "sequence": [
             "prepare immutable preprocess inputs",
             "SCF",
