@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -13,6 +14,7 @@ from w90flow.config import load_project
 from w90flow.attempts import classify_failure, import_completed_attempt, materialize_plan_energy_reference, plan_candidate, recorded_or_classified_failure
 from w90flow.candidates import normalize_projection, num_wann_from_projection, suggest_projection_candidates
 from w90flow.dataset import make_attempt_record
+from w90flow.executor import _build_potcar
 from w90flow.material_pool import screen_c2db
 from w90flow.orchestrator import RunLock, WorkflowBlocked, choose_retry_reason, fit_from_precomputed, group_has_runnable_member, inspect_workflow, run_workflow
 from w90flow.parsers import parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_procar_orbital_scores
@@ -112,6 +114,37 @@ S,1,1|3;S,2,1-3;Si,0,1-3
             outcar = Path(temporary) / "OUTCAR"
             outcar.write_text(" E-fermi : 1.25 eV\n E-fermi : 2.75 eV\n", encoding="utf-8")
             self.assertEqual(parse_fermi_outcar(outcar), 2.75)
+
+    def test_potcar_registry_label_can_differ_from_poscar_element(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry = root / "registry"
+            component = registry / "Zr_sv/POTCAR"
+            component.parent.mkdir(parents=True)
+            component.write_bytes(b"synthetic Zr_sv POTCAR\n")
+            component_hash = hashlib.sha256(component.read_bytes()).hexdigest()
+            lock = root / "POTCAR_LOCK.json"
+            lock.write_text(json.dumps({
+                "registry": str(registry),
+                "sets": {
+                    "Zr_sv_test": {
+                        "order": ["Zr"],
+                        "labels": {"Zr": "Zr_sv"},
+                        "component_sha256": {"Zr": component_hash},
+                        "combined_sha256": component_hash,
+                    }
+                },
+            }), encoding="utf-8")
+            output = root / "POTCAR"
+            result = _build_potcar(
+                {"pseudopotentials": {"lock_resolved": str(lock)}},
+                "Zr_sv_test",
+                ["Zr"],
+                output,
+            )
+            self.assertEqual(output.read_bytes(), component.read_bytes())
+            self.assertEqual(result["components"][0]["element"], "Zr")
+            self.assertEqual(result["components"][0]["registry_label"], "Zr_sv")
 
     @unittest.skipUnless(HAS_REFERENCE_FIXTURES, "set W90FLOW_REFERENCE_ROOT for licensed/large reference fixtures")
     def test_real_eigenval_and_hr(self) -> None:

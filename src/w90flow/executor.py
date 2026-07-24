@@ -90,19 +90,33 @@ def _build_potcar(config: dict[str, Any], set_name: str, elements: list[str], ou
     order = list(specification["order"])
     if order != elements:
         raise ValueError(f"POTCAR 顺序 {order} 与 POSCAR 元素顺序 {elements} 不一致。")
+    labels = specification.get("labels", {})
+    if not isinstance(labels, dict):
+        raise ValueError(f"POTCAR set {set_name} 的 labels 必须是元素到 registry 标签的映射。")
+    unknown_labels = sorted(set(labels) - set(order))
+    if unknown_labels:
+        raise ValueError(
+            f"POTCAR set {set_name} 的 labels 含非 POSCAR 元素：{', '.join(unknown_labels)}"
+        )
 
     chunks: list[bytes] = []
     components: list[dict[str, Any]] = []
-    for component in order:
-        source = registry / component / "POTCAR"
+    for element in order:
+        registry_label = str(labels.get(element, element))
+        source = registry / registry_label / "POTCAR"
         if not source.is_file():
-            raise ValueError(f"registry 缺少 {component}/POTCAR")
+            raise ValueError(f"registry 缺少 {registry_label}/POTCAR（POSCAR 元素 {element}）")
         actual = sha256_file(source)
-        expected = specification["component_sha256"][component]
+        expected = specification["component_sha256"][element]
         if actual != expected:
-            raise ValueError(f"{component} POTCAR SHA256 不符。")
+            raise ValueError(f"{element}（registry 标签 {registry_label}）POTCAR SHA256 不符。")
         chunks.append(source.read_bytes())
-        components.append({"component": component, "source": str(source), "sha256": actual})
+        components.append({
+            "element": element,
+            "registry_label": registry_label,
+            "source": str(source),
+            "sha256": actual,
+        })
     payload = b"".join(chunks)
     combined = hashlib.sha256(payload).hexdigest()
     if combined != specification["combined_sha256"]:
