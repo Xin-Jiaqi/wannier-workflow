@@ -95,10 +95,10 @@ w90flow prepare /path/to/project.yaml --runs-root /path/to/private/runs
 完成 `prepare` 后，一条命令可以从当前断点确定性推进 SCF 到 top-K 导出：
 
 ```bash
-运行W90Flow.command run RUN_DIR
-运行W90Flow.command run RUN_DIR --execute
-运行W90Flow.command resume RUN_DIR --execute
-运行W90Flow.command inspect RUN_DIR
+w90flow run RUN_DIR
+w90flow run RUN_DIR --execute
+w90flow resume RUN_DIR --execute
+w90flow inspect RUN_DIR
 ```
 
 默认是 dry-run；只有加 `--execute` 且配置中 `execution.allow_execute: true` 才运行。`run` 与 `resume` 共用同一状态机，会拒绝同一 run 的重复监督器，并对基础设施中断只允许一次同输入恢复。
@@ -106,12 +106,12 @@ w90flow prepare /path/to/project.yaml --runs-root /path/to/private/runs
 长时运行请用 Python 监督层，它会在每个完整阶段边界自动衔接，中间按设定间隔轮询 PID、输出更新和阶段状态：
 
 ```bash
-运行W90Flow.command supervise RUN_DIR
-运行W90Flow.command supervise RUN_DIR --execute \
+w90flow supervise RUN_DIR
+w90flow supervise RUN_DIR --execute \
   --poll-seconds 30 --heartbeat-seconds 300 \
   --no-progress-seconds 1800 --stage-timeout-seconds 86400 \
   --max-hours 12
-运行W90Flow.command supervisor-status RUN_DIR
+w90flow supervisor-status RUN_DIR
 ```
 
 `supervise` 也默认 dry-run。第一个 `SIGINT/SIGTERM`、墙钟截止、无输出进展或阶段超时都不会自动修改投影、能窗、INCAR 或质量门槛；正在运行的引擎先到达完整阶段边界，然后写入 checkpoint 并停止衔接下一阶段。详细状态文件和恢复规则见 [SUPERVISOR.md](SUPERVISOR.md)。
@@ -132,27 +132,27 @@ Wannier 拟合与非线性光学求和器保持为两个独立程序。核心交
 下面的分步命令仍保留，用于调试和审计：
 
 ```bash
-运行W90Flow.command run-stage RUN_DIR scf
-运行W90Flow.command run-stage RUN_DIR scf --execute
-运行W90Flow.command run-stage RUN_DIR band --execute
-运行W90Flow.command generate-candidates RUN_DIR
-运行W90Flow.command run-stage RUN_DIR wannier --execute
-运行W90Flow.command evaluate RUN_DIR
-运行W90Flow.command finalize RUN_DIR
+w90flow run-stage RUN_DIR scf
+w90flow run-stage RUN_DIR scf --execute
+w90flow run-stage RUN_DIR band --execute
+w90flow generate-candidates RUN_DIR
+w90flow run-stage RUN_DIR wannier --execute
+w90flow evaluate RUN_DIR
+w90flow finalize RUN_DIR
 ```
 
 候选的有限 exact/disentanglement 尝试、统一目标区判分和三层排名：
 
 ```bash
-运行W90Flow.command plan-attempts RUN_DIR
-运行W90Flow.command run-attempt RUN_DIR STRUCTURE CANDIDATE attempt-001
-运行W90Flow.command run-attempt RUN_DIR STRUCTURE CANDIDATE attempt-001 --execute
-运行W90Flow.command evaluate-attempt RUN_DIR STRUCTURE CANDIDATE attempt-001
-运行W90Flow.command rank-attempts RUN_DIR
-运行W90Flow.command export-ranked-attempts RUN_DIR
+w90flow plan-attempts RUN_DIR
+w90flow run-attempt RUN_DIR STRUCTURE CANDIDATE attempt-001
+w90flow run-attempt RUN_DIR STRUCTURE CANDIDATE attempt-001 --execute
+w90flow evaluate-attempt RUN_DIR STRUCTURE CANDIDATE attempt-001
+w90flow rank-attempts RUN_DIR
+w90flow export-ranked-attempts RUN_DIR
 ```
 
-`rank-attempts` 分开记录 PROCAR/PyW90 试算优先级、真实拟合排名和光学完备基组建议。`export-ranked-attempts` 只导出 POSCAR、hr、纯 Wannier 中心、比较图、win 和质量/哈希清单，不含 POTCAR/CHGCAR/MMN。最简流程图见 [WORKFLOW_ONE_PAGE.md](../01_流程规范/WORKFLOW_ONE_PAGE.md)。
+`rank-attempts` 分开记录 PROCAR/PyW90 试算优先级、真实拟合排名和光学完备基组建议。`export-ranked-attempts` 只导出 POSCAR、hr、纯 Wannier 中心、比较图、win 和质量/哈希清单，不含 POTCAR/CHGCAR/MMN。冻结流程与验收边界见 [AUTOMATION_V1_SPEC.md](AUTOMATION_V1_SPEC.md)。
 
 `pyw90-baseline` 只将 PyW90 `eig suggest` 的终端表转成带工具/输入哈希的 JSON 对照。它不覆盖 W90Flow 内部状态数约束，也不能放宽质量硬门槛。
 
@@ -163,7 +163,7 @@ Wannier 拟合与非线性光学求和器保持为两个独立程序。核心交
 已有 Wannier attempt 只有在 `POSCAR + POTCAR + INCAR + KPOINTS + CHGCAR` 五个 SHA256 全部相同时才能复用；复用后仍按新项目的目标能区和门槛重新评价，不导入旧排名：
 
 ```bash
-运行W90Flow.command import-attempt RUN_DIR STRUCTURE CANDIDATE attempt-001 \
+w90flow import-attempt RUN_DIR STRUCTURE CANDIDATE attempt-001 \
   --source /absolute/completed/attempt
 ```
 
@@ -172,8 +172,8 @@ Wannier 拟合与非线性光学求和器保持为两个独立程序。核心交
 SCF 的 `POSCAR + POTCAR + INCAR + KPOINTS` 四个哈希完全一致时可以零复制复用；Band 还必须核验其 `CHGCAR`。任何一个输入不同都会拒绝：
 
 ```bash
-运行W90Flow.command import-stage RUN_DIR scf --source L1=/absolute/old/L1/scf --source L2=/absolute/old/L2/scf
-运行W90Flow.command import-stage RUN_DIR band --source L1=/absolute/old/L1/band --source L2=/absolute/old/L2/band
+w90flow import-stage RUN_DIR scf --source L1=/absolute/old/L1/scf --source L2=/absolute/old/L2/scf
+w90flow import-stage RUN_DIR band --source L1=/absolute/old/L1/band --source L2=/absolute/old/L2/band
 ```
 
 C2DB 材料池筛选始终以 SQLite 只读模式打开源数据库：
