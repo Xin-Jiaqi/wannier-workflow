@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import itertools
 import math
 import os
 import re
 import shutil
 import subprocess
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -61,10 +63,17 @@ def _target_band_indices(energies: list[list[float]], target_min: float, target_
     if not energies:
         return []
     nbands = len(energies[0])
-    return [
+    touched = [
         band + 1 for band in range(nbands)
         if any(target_min <= row[band] <= target_max for row in energies)
     ]
+    if not touched:
+        return []
+    # Wannier eigenvalues are compared as a continuous sorted manifold.  If an
+    # intermediate DFT band never enters the numeric energy interval, skipping
+    # it would nevertheless map non-contiguous DFT indices onto a contiguous
+    # Wannier slice.  Protect the full band-index interval instead.
+    return list(range(min(touched), max(touched) + 1))
 
 
 def _boundary_gaps(energies: list[list[float]], start: int, stop: int) -> dict[str, float | None]:
@@ -76,7 +85,26 @@ def _boundary_gaps(energies: list[list[float]], start: int, stop: int) -> dict[s
 
 
 def _candidate_character(band_features: list[dict[str, Any]], projection: list[str]) -> list[float]:
-    return [sum(item["orbital_scores"].get(label, 0.0) for label in projection) for item in band_features]
+    component_shell = {
+        "px": "p", "py": "p", "pz": "p",
+        "dxy": "d", "dyz": "d", "dz2": "d", "dxz": "d", "dx2": "d", "dx2-y2": "d",
+    }
+
+    def score(item: dict[str, Any], label: str) -> float:
+        scores = item["orbital_scores"]
+        if label in scores:
+            return float(scores[label])
+        element, orbital = label.split(":", 1)
+        shell = component_shell.get(orbital)
+        if shell is None:
+            return 0.0
+        # PROCAR analysis currently records shell totals.  Split that total
+        # evenly only for band-selection heuristics; the real Wannier attempt
+        # and the hard band-quality gate remain authoritative.
+        divisor = 3 if shell == "p" else 5
+        return float(scores.get(f"{element}:{shell}", 0.0)) / divisor
+
+    return [sum(score(item, label) for label in projection) for item in band_features]
 
 
 def _exact_plan(
@@ -127,6 +155,8 @@ def _disentanglement_plans(
     target_indices: list[int],
     target_min: float,
     target_max: float,
+    max_window_attempts: int,
+    max_localization_retries: int,
 ) -> list[dict[str, Any]]:
     character = _candidate_character(band_features, projection)
     desired = set(target_indices)
@@ -168,9 +198,28 @@ def _disentanglement_plans(
         "dis_num_iter": 500,
         "dis_mix_ratio": 0.5,
     }
-    wider = {**seed, "dis_win_min_eV": round(raw_min - 0.5, 6), "dis_win_max_eV": round(outer_max + 0.5, 6), "retry_reason": "outer_window_expansion"}
-    localized = {**seed, "dis_num_iter": 1000, "dis_mix_ratio": 0.3, "num_iter": 5000, "retry_reason": "convergence_retry"}
-    return [seed, wider, localized]
+    plans = [seed]
+    for retry_index in range(1, max_window_attempts):
+        expansion = 0.5 * retry_index
+        plans.append({
+            **seed,
+            "dis_win_min_eV": round(raw_min - expansion, 6),
+            "dis_win_max_eV": round(outer_max + expansion, 6),
+            "retry_class": "outer_window_expansion",
+            "retry_index": retry_index,
+            "retry_reason": f"outer_window_expansion_{retry_index:03d}",
+        })
+    for retry_index in range(1, max_localization_retries + 1):
+        plans.append({
+            **seed,
+            "dis_num_iter": 500 * (retry_index + 1),
+            "dis_mix_ratio": round(max(0.1, 0.5 - 0.1 * retry_index), 3),
+            "num_iter": 5000 * retry_index,
+            "retry_class": "convergence_retry",
+            "retry_index": retry_index,
+            "retry_reason": f"convergence_retry_{retry_index:03d}",
+        })
+    return plans
 
 
 def plan_candidate(
@@ -180,8 +229,20 @@ def plan_candidate(
     target_min: float,
     target_max: float,
     isolation_threshold_eV: float = 0.02,
+    max_window_attempts: int = 2,
+    max_localization_retries: int = 1,
 ) -> list[dict[str, Any]]:
+    if not 1 <= max_window_attempts <= 4:
+        raise ValueError("有限状态机支持 1 到 4 个 window attempts。")
+    if not 0 <= max_localization_retries <= 3:
+        raise ValueError("有限状态机支持 0 到 3 个 localization retries。")
     target_indices = _target_band_indices(energies, target_min, target_max)
+    # A Wannier Hamiltonian with fewer eigenvalues than the protected DFT band
+    # manifold can never reproduce that manifold.  Reject it before launching
+    # VASP/Wannier instead of spending a numerical attempt on an impossible
+    # quality comparison.
+    if len(target_indices) > int(candidate["num_wann"]):
+        return []
     exact = _exact_plan(
         energies,
         band_features,
@@ -200,6 +261,8 @@ def plan_candidate(
         target_indices,
         target_min,
         target_max,
+        max_window_attempts,
+        max_localization_retries,
     )
 
 
@@ -269,6 +332,172 @@ def _build_incar(template_path: Path, candidate: dict[str, Any], plan: dict[str,
     return text
 
 
+def build_standalone_w90_input(
+    incar_text: str,
+    num_wann: int,
+    total_vasp_bands: int,
+    plan: dict[str, Any],
+) -> str:
+    """Build the pre-existing .win required by patched VASP 5.4.4.
+
+    VASP 6.x accepts the inline ``WANNIER90_WIN`` INCAR block.  The patched
+    VASP 5.4.4 interface used on some clusters instead reads ``wannier90.win``
+    before VASP starts; without that file it silently sets num_wann=NBANDS and
+    discards the requested projections/windows.
+    """
+    inline = re.search(r"(?ims)(WANNIER90_WIN\s*=\s*\"\s*\n)(.*?)(\n\")", incar_text)
+    if not inline:
+        raise ValueError("Wannier INCAR 缺少多行 WANNIER90_WIN。")
+    if num_wann <= 0 or total_vasp_bands <= 0 or num_wann > total_vasp_bands:
+        raise ValueError("独立 wannier90.win 的 NUM_WANN/NUM_BANDS 非法。")
+
+    text = inline.group(2).strip()
+    text = re.sub(r"(?im)^\s*num_(wann|bands)\s*[=:].*$\n?", "", text).strip()
+    # The VASP2WANNIER90 patch on the Paracloud VASP 5.4.4 build links
+    # Wannier90 2.1.0.  That parser rejects ``precond`` before VASP can write
+    # AMN/MMN/EIG, although newer project templates may contain the keyword.
+    # Removing it changes only the localization optimiser, not the Hamiltonian,
+    # projections, energy windows, or acceptance criteria.
+    text = re.sub(r"(?im)^\s*precond\s*[=:].*$\n?", "", text).strip()
+    excluded = [int(value) for value in plan.get("exclude_bands_1_based", [])]
+    if any(value < 1 or value > total_vasp_bands for value in excluded):
+        raise ValueError("exclude_bands 超出 VASP 能带范围。")
+    num_bands = total_vasp_bands - len(set(excluded))
+    if num_bands < num_wann:
+        raise ValueError("排除能带后 NUM_BANDS 小于 NUM_WANN。")
+    return (
+        f"num_wann = {num_wann}\n"
+        f"num_bands = {num_bands}\n\n"
+        f"{text}\n"
+    )
+
+
+def canonicalize_standalone_w90_kpoints(win_text: str) -> tuple[str, int]:
+    """Match an old VASP2WANNIER90 MMN file's signed k-point convention.
+
+    Some patched VASP 5.4.4 builds calculate MMN neighbour cells from VASP's
+    internal ``[-0.5, 0.5)`` coordinates, but append equivalent ``[0, 1)``
+    coordinates to ``wannier90.win``.  External Wannier90 then reconstructs a
+    different neighbour-cell labelling and rejects the otherwise valid MMN.
+    Canonicalising only the explicit k-point block restores the representation
+    used to create MMN; it does not change the physical mesh.
+    """
+    match = re.search(r"(?ims)(^\s*begin\s+kpoints\s*$)(.*?)(^\s*end\s+kpoints\s*$)", win_text)
+    if not match:
+        raise ValueError("VASP 完成后的 wannier90.win 缺少 kpoints 区块。")
+    converted: list[str] = []
+    moved = 0
+    for raw in match.group(2).splitlines():
+        if not raw.strip():
+            converted.append(raw)
+            continue
+        fields = raw.split()
+        if len(fields) != 3:
+            raise ValueError(f"非法 Wannier90 k 点行：{raw}")
+        values = [float(value) for value in fields]
+        canonical: list[float] = []
+        for value in values:
+            shifted = value
+            while shifted >= 0.5:
+                shifted -= 1.0
+            while shifted < -0.5:
+                shifted += 1.0
+            if abs(shifted - value) > 1e-10:
+                moved += 1
+            canonical.append(shifted)
+        converted.append("  " + " ".join(f"{value:.12f}" for value in canonical))
+    body = "\n" + "\n".join(converted) + "\n"
+    return win_text[:match.start(2)] + body + win_text[match.end(2):], moved
+
+
+def reconcile_mmn_neighbour_cells(mmn_path: str | Path, nnkp_path: str | Path) -> dict[str, Any]:
+    """Reconcile a VASP 5.4.4 MMN cell-axis convention with Wannier90.
+
+    The Paracloud VASP2WANNIER90 patch writes the correct k-pairs and overlap
+    matrices, but its reciprocal-cell components can be permuted relative to
+    the ``.win``/``.nnkp`` basis.  Try every signed axis permutation and apply
+    one only when it makes the complete MMN neighbour set exactly equal to the
+    neighbour set independently generated by Wannier90.  Otherwise fail rather
+    than guessing or changing any overlap values.
+    """
+    mmn = Path(mmn_path)
+    nnkp = Path(nnkp_path)
+    with mmn.open("r", encoding="utf-8", errors="replace") as handle:
+        comment = handle.readline()
+        dimensions = handle.readline()
+        num_bands, num_kpoints, num_neighbours = map(int, dimensions.split())
+        headers: list[tuple[int, int, int, int, int]] = []
+        for _ in range(num_kpoints * num_neighbours):
+            header = tuple(map(int, handle.readline().split()))
+            if len(header) != 5:
+                raise ValueError("MMN 邻接块头必须包含五个整数。")
+            headers.append(header)
+            for _ in range(num_bands * num_bands):
+                if not handle.readline():
+                    raise ValueError("MMN overlap 数据提前结束。")
+
+    nnkp_lines = nnkp.read_text(encoding="utf-8", errors="replace").splitlines()
+    start = next(
+        (index for index, line in enumerate(nnkp_lines) if line.strip().lower() == "begin nnkpts"),
+        None,
+    )
+    if start is None:
+        raise ValueError("NNKP 缺少 nnkpts 区块。")
+    expected_neighbours = int(nnkp_lines[start + 1].split()[0])
+    if expected_neighbours != num_neighbours:
+        raise ValueError("MMN 与 NNKP 的每个 k 点邻接数不同。")
+    expected = [
+        tuple(map(int, line.split()))
+        for line in nnkp_lines[start + 2:start + 2 + num_kpoints * expected_neighbours]
+    ]
+    if len(expected) != len(headers) or any(len(header) != 5 for header in expected):
+        raise ValueError("NNKP 邻接块长度非法。")
+
+    transforms: list[tuple[tuple[int, int, int], tuple[int, int, int], list[tuple[int, int, int, int, int]]]] = []
+    expected_counter = Counter(expected)
+    candidates = [((0, 1, 2), (1, 1, 1))]
+    candidates.extend(
+        (permutation, signs)
+        for permutation in itertools.permutations(range(3))
+        for signs in itertools.product((-1, 1), repeat=3)
+        if (permutation, signs) != ((0, 1, 2), (1, 1, 1))
+    )
+    for permutation, signs in candidates:
+        transformed = []
+        for first, second, gx, gy, gz in headers:
+            cell = (gx, gy, gz)
+            mapped = tuple(signs[index] * cell[permutation[index]] for index in range(3))
+            transformed.append((first, second, *mapped))
+        if Counter(transformed) == expected_counter:
+            transforms.append((permutation, signs, transformed))
+            break
+    if not transforms:
+        raise ValueError("找不到能使 MMN 与 NNKP 完整一致的 reciprocal-cell 轴变换。")
+    permutation, signs, transformed = transforms[0]
+    changed = sum(before != after for before, after in zip(headers, transformed))
+    if changed:
+        temporary = mmn.with_name(mmn.name + ".reconcile.tmp")
+        with mmn.open("r", encoding="utf-8", errors="replace") as source, temporary.open(
+            "w", encoding="utf-8"
+        ) as target:
+            target.write(source.readline())
+            target.write(source.readline())
+            for fixed in transformed:
+                source.readline()
+                target.write("".join(f"{value:5d}" for value in fixed) + "\n")
+                for _ in range(num_bands * num_bands):
+                    target.write(source.readline())
+        os.replace(temporary, mmn)
+    return {
+        "permutation": list(permutation),
+        "signs": list(signs),
+        "changed_headers": changed,
+        "num_headers": len(headers),
+        "matched_exactly": True,
+        "sha256": sha256_file(mmn),
+    }
+
+
 def materialize_plan_energy_reference(
     plan: dict[str, Any],
     fermi_eV: float,
@@ -317,6 +546,13 @@ def create_attempts(run_dir: str | Path) -> dict[str, Any]:
     isolation_threshold = float(config.get("candidates", {}).get("exact_min_boundary_gap_eV", 0.05))
     if isolation_threshold <= 0:
         raise ValueError("candidates.exact_min_boundary_gap_eV 必须大于零。")
+    iteration = config.get("iteration", {})
+    max_window_attempts = int(iteration.get("max_window_attempts_per_candidate", 2))
+    max_localization_retries = int(iteration.get("max_localization_retries", 1))
+    if not 1 <= max_window_attempts <= 4:
+        raise ValueError("iteration.max_window_attempts_per_candidate 必须在 1 到 4 之间。")
+    if not 0 <= max_localization_retries <= 3:
+        raise ValueError("iteration.max_localization_retries 必须在 0 到 3 之间。")
     contexts: dict[str, dict[str, Any]] = {}
     for structure in config["structures"]:
         sid = str(structure["id"])
@@ -370,6 +606,8 @@ def create_attempts(run_dir: str | Path) -> dict[str, Any]:
                 target_min,
                 target_max,
                 isolation_threshold,
+                max_window_attempts,
+                max_localization_retries,
             )
     all_plans: dict[str, Any] = {}
     for structure in config["structures"]:
@@ -389,6 +627,8 @@ def create_attempts(run_dir: str | Path) -> dict[str, Any]:
                 target_min,
                 target_max,
                 isolation_threshold,
+                max_window_attempts,
+                max_localization_retries,
             )
             candidate_record = {"candidate": candidate, "attempts": []}
             if existing_projection == candidate["projection"] and (base / "05_quality/quality.json").is_file():
@@ -454,6 +694,10 @@ def create_attempts(run_dir: str | Path) -> dict[str, Any]:
         "ensemble_mode": mode,
         "energy_reference": energy_reference,
         "exact_min_boundary_gap_eV": isolation_threshold,
+        "iteration_budget": {
+            "max_window_attempts_per_candidate": max_window_attempts,
+            "max_localization_retries": max_localization_retries,
+        },
         "common_plan_across_structures": mode == "common_basis",
         "structures": all_plans,
         "failure_transitions": FAILURE_TRANSITIONS,
@@ -587,24 +831,32 @@ def recorded_or_classified_failure(record: dict[str, Any], directory: Path) -> s
     return classify_failure(directory, int(record.get("returncode", 1)))
 
 
-def _commands(config: dict[str, Any], directory: Path) -> list[list[str]]:
+def _commands(config: dict[str, Any], directory: Path, *, mpi_processes: int | None = None) -> list[list[str]]:
     workspace = launcher_root()
     backend = config.get("backend", {})
     default_kind = "ncl" if config.get("physics", {}).get("soc") else "std"
-    return [
+    commands = [
         [
             str(workspace / "00_命令入口/计算/运行VASP.command"),
             str(directory),
             str(backend.get("vasp", default_kind)),
-            str(backend.get("mpi_processes", 2)),
+            str(mpi_processes if mpi_processes is not None else backend.get("mpi_processes", 2)),
         ],
-        [
+    ]
+    if backend.get("wannier_input_mode", "embedded") == "standalone_win":
+        commands.append([
+            str(workspace / "00_命令入口/计算/运行Wannier90.command"),
+            str(directory),
+            "wannier90",
+            "pre",
+        ])
+    commands.append([
             str(workspace / "00_命令入口/计算/运行Wannier90.command"),
             str(directory),
             "wannier90",
             "run",
-        ],
-    ]
+        ])
+    return commands
 
 
 def run_attempt(
@@ -613,6 +865,7 @@ def run_attempt(
     candidate: str,
     attempt: str,
     execute: bool = False,
+    mpi_processes: int | None = None,
 ) -> dict[str, Any]:
     root = Path(run_dir).expanduser().resolve()
     config = _load_snapshot(root)
@@ -623,7 +876,9 @@ def run_attempt(
     record = read_json(record_path)
     required = [directory / name for name in ("POSCAR", "POTCAR", "INCAR", "KPOINTS", "CHGCAR")]
     missing = [str(path) for path in required if not path.is_file()]
-    commands = _commands(config, directory)
+    if mpi_processes is not None and mpi_processes <= 0:
+        raise ValueError("mpi_processes 必须是正整数。")
+    commands = _commands(config, directory, mpi_processes=mpi_processes)
     if not execute:
         return {"mode": "DRY_RUN", "path": str(directory), "commands": commands, "missing_inputs": missing, "passed": not missing}
     if not config.get("execution", {}).get("allow_execute", False):
@@ -655,7 +910,28 @@ def run_attempt(
             "runner_log": str(archived_log),
         })
         record["execution_history"] = history
-    record.update({"status": "RUNNING", "started_utc": _utc_now(), "commands": commands})
+    if config.get("backend", {}).get("wannier_input_mode", "embedded") == "standalone_win":
+        eigenval = parse_eigenval(root / "structures" / structure / "02_band/EIGENVAL")
+        standalone = build_standalone_w90_input(
+            (directory / "INCAR").read_text(encoding="utf-8", errors="replace"),
+            int(record["num_wann"]),
+            int(eigenval["nbands"]),
+            dict(record["plan"]),
+        )
+        (directory / "wannier90.win").write_text(standalone, encoding="utf-8")
+        record["standalone_w90_input"] = {
+            "mode": "vasp54_preexisting_win",
+            "path": str(directory / "wannier90.win"),
+            "sha256": sha256_file(directory / "wannier90.win"),
+            "num_wann": int(record["num_wann"]),
+            "num_bands": int(eigenval["nbands"]) - len(set(record["plan"].get("exclude_bands_1_based", []))),
+        }
+    record.update({
+        "status": "RUNNING",
+        "started_utc": _utc_now(),
+        "commands": commands,
+        "runtime_mpi_processes": mpi_processes if mpi_processes is not None else int(config.get("backend", {}).get("mpi_processes", 2)),
+    })
     atomic_json(record_path, record)
     log_path = directory / "runner.log"
     executed: list[dict[str, Any]] = []
@@ -680,6 +956,38 @@ def run_attempt(
             executed.append({"command": command, "returncode": returncode})
             if returncode != 0:
                 break
+            if config.get("backend", {}).get("wannier_input_mode", "embedded") == "standalone_win":
+                try:
+                    if index == 0:
+                        win_path = directory / "wannier90.win"
+                        canonical, moved = canonicalize_standalone_w90_kpoints(
+                            win_path.read_text(encoding="utf-8", errors="replace")
+                        )
+                        win_path.write_text(canonical, encoding="utf-8")
+                        record["standalone_w90_post_vasp"] = {
+                            "mode": "vasp54_signed_kpoint_compatibility",
+                            "path": str(win_path),
+                            "sha256": sha256_file(win_path),
+                            "shifted_components": moved,
+                        }
+                    elif index == 1:
+                        record["standalone_w90_mmn_reconciliation"] = reconcile_mmn_neighbour_cells(
+                            directory / "wannier90.mmn",
+                            directory / "wannier90.nnkp",
+                        )
+                    atomic_json(record_path, record)
+                except Exception as exc:
+                    message = f"W90FLOW_VASP54_COMPATIBILITY_ERROR: {exc}\n"
+                    log.write(message.encode("utf-8", errors="replace"))
+                    log.flush()
+                    executed.append({
+                        "compatibility_step": "post_vasp" if index == 0 else "post_preprocessor",
+                        "returncode": 1,
+                        "error": str(exc),
+                    })
+                    record["compatibility_error"] = str(exc)
+                    returncode = 1
+                    break
     required_outputs = [directory / name for name in ("wannier90.wout", "wannier90_hr.dat", "wannier90_centres.xyz", "wannier90_band.dat")]
     output_missing = [path.name for path in required_outputs if not path.is_file()]
     completed = False

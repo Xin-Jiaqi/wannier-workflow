@@ -14,6 +14,18 @@ from .paths import matplotlib_cache_dir
 from .state import atomic_json, read_json, sha256_file, update_stage
 
 
+class IncompleteTargetSubspace(ValueError):
+    """The Wannier model is too small to represent the protected DFT manifold."""
+
+    def __init__(self, target_band_count: int, model_dimension: int):
+        self.target_band_count = target_band_count
+        self.model_dimension = model_dimension
+        super().__init__(
+            "目标 DFT 能带数大于 Wannier 模型维数："
+            f"{target_band_count} > {model_dimension}。"
+        )
+
+
 def _cross(a: list[float], b: list[float]) -> list[float]:
     return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 
@@ -106,18 +118,35 @@ def band_metrics(
     dft_blocks: list[list[tuple[float, float]]],
     w90_blocks: list[list[tuple[float, float]]],
     occupied_count: int,
-) -> tuple[dict[str, float], list[list[float]]]:
+    *,
+    error_energy_window_eV: tuple[float, float] | None = None,
+) -> tuple[dict[str, Any], list[list[float]]]:
     if len(dft_blocks) != len(w90_blocks):
         raise ValueError("DFT/Wannier 能带数不同。")
     if not 0 < occupied_count < len(dft_blocks):
         raise ValueError("占据带数不在比较能带范围内。")
+    if (
+        error_energy_window_eV is not None
+        and error_energy_window_eV[0] >= error_energy_window_eV[1]
+    ):
+        raise ValueError("误差统计能量窗口必须递增。")
     errors_mev: list[float] = []
     interpolated: list[list[float]] = []
+    excluded_point_count = 0
     for dft, w90 in zip(dft_blocks, w90_blocks):
         targets = [point[0] for point in dft]
         values = _interpolate(w90, targets)
         interpolated.append(values)
-        errors_mev.extend(1000.0 * (w90_energy - dft_point[1]) for w90_energy, dft_point in zip(values, dft))
+        for w90_energy, dft_point in zip(values, dft):
+            if (
+                error_energy_window_eV is not None
+                and not error_energy_window_eV[0] <= dft_point[1] <= error_energy_window_eV[1]
+            ):
+                excluded_point_count += 1
+                continue
+            errors_mev.append(1000.0 * (w90_energy - dft_point[1]))
+    if not errors_mev:
+        raise ValueError("声明的目标能量窗口内没有可比较的 DFT 能带点。")
     absolute = [abs(value) for value in errors_mev]
     dft_valence = max(point[1] for band in dft_blocks[:occupied_count] for point in band)
     dft_conduction = min(point[1] for band in dft_blocks[occupied_count:] for point in band)
@@ -131,6 +160,13 @@ def band_metrics(
         "dft_indirect_gap_ev": dft_conduction - dft_valence,
         "w90_indirect_gap_ev": w90_conduction - w90_valence,
         "gap_error_mev": 1000.0 * ((w90_conduction - w90_valence) - (dft_conduction - dft_valence)),
+        "compared_point_count": len(errors_mev),
+        "excluded_point_count": excluded_point_count,
+        "error_energy_window_eV": (
+            list(error_energy_window_eV)
+            if error_energy_window_eV is not None
+            else None
+        ),
     }
     return metrics, interpolated
 
@@ -185,10 +221,11 @@ def _plot_comparison(
     w90: list[list[tuple[float, float]]],
     fermi: float,
     title: str,
-    metrics: dict[str, float],
+    metrics: dict[str, Any],
+    display_energy_window_eV: tuple[float, float] | None = None,
 ) -> None:
     cache = matplotlib_cache_dir()
-    cache.mkdir(exist_ok=True)
+    cache.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", str(cache))
     import matplotlib
     matplotlib.use("Agg")
@@ -202,6 +239,8 @@ def _plot_comparison(
     ax.axhline(0.0, color="#777777", lw=0.8, ls=":")
     ax.set_xlabel("k path")
     ax.set_ylabel(r"Energy $-E_F$ (eV)")
+    if display_energy_window_eV is not None:
+        ax.set_ylim(*display_energy_window_eV)
     ax.set_title(title)
     ax.legend(frameon=False)
     ax.text(0.98, 0.02, f"MAE {metrics['mae_mev']:.3f} meV\nP95 {metrics['p95_mev']:.3f} meV\nmax {metrics['max_mev']:.3f} meV", transform=ax.transAxes, ha="right", va="bottom")
@@ -313,13 +352,20 @@ def _best_contiguous_w90_slice(
     dft: list[list[tuple[float, float]]],
     w90: list[list[tuple[float, float]]],
     occupied_count: int,
-) -> tuple[int, dict[str, float]]:
+    *,
+    error_energy_window_eV: tuple[float, float] | None = None,
+) -> tuple[int, dict[str, Any]]:
     """Map a disentangled model to the target bands without manual band labels."""
     if len(dft) > len(w90):
-        raise ValueError("目标 DFT 能带数大于 Wannier 模型维数。")
-    ranked: list[tuple[tuple[float, float, float], int, dict[str, float]]] = []
+        raise IncompleteTargetSubspace(len(dft), len(w90))
+    ranked: list[tuple[tuple[float, float, float], int, dict[str, Any]]] = []
     for start in range(len(w90) - len(dft) + 1):
-        metrics, _ = band_metrics(dft, w90[start:start + len(dft)], occupied_count)
+        metrics, _ = band_metrics(
+            dft,
+            w90[start:start + len(dft)],
+            occupied_count,
+            error_energy_window_eV=error_energy_window_eV,
+        )
         ranked.append(((metrics["rmse_mev"], metrics["p95_mev"], metrics["max_mev"]), start, metrics))
     _, start, metrics = min(ranked, key=lambda item: item[0])
     return start, metrics
@@ -349,6 +395,21 @@ def evaluate_attempt(
     poscar = parse_poscar(base / "00_input/POSCAR")
     dft_all = dft_band_blocks(eig, poscar["lattice_angstrom"])
     w90_all = read_w90_band_blocks(directory / "wannier90_band.dat")
+    fermi = parse_fermi_outcar(base / "01_scf/OUTCAR")
+    target_window_declared = tuple(float(value) for value in config["physics"]["target_energy_eV"])
+    energy_reference = str(config["physics"].get("energy_reference", "absolute"))
+    if energy_reference == "fermi_relative":
+        target_window_absolute = (
+            fermi + target_window_declared[0],
+            fermi + target_window_declared[1],
+        )
+        display_energy_window = target_window_declared
+    else:
+        target_window_absolute = target_window_declared
+        display_energy_window = (
+            target_window_declared[0] - fermi,
+            target_window_declared[1] - fermi,
+        )
     target_indices = list(record["plan"]["target_bands_1_based"])
     dft_target = [dft_all[index - 1] for index in target_indices]
     soc = bool(config["physics"].get("soc"))
@@ -373,9 +434,19 @@ def evaluate_attempt(
             "retained_vasp_bands_1_based": retained,
             "target_w90_bands_1_based": [index + 1 for index in model_indices],
         }
-        target_metrics, _ = band_metrics(dft_target, w90_target, target_occupied)
+        target_metrics, _ = band_metrics(
+            dft_target,
+            w90_target,
+            target_occupied,
+            error_energy_window_eV=target_window_absolute,
+        )
     else:
-        start, target_metrics = _best_contiguous_w90_slice(dft_target, w90_all, target_occupied)
+        start, target_metrics = _best_contiguous_w90_slice(
+            dft_target,
+            w90_all,
+            target_occupied,
+            error_energy_window_eV=target_window_absolute,
+        )
         w90_target = w90_all[start:start + len(dft_target)]
         model_offset = target_indices[0] - (start + 1)
         model_occupied = original_occupied - model_offset
@@ -401,9 +472,16 @@ def evaluate_attempt(
     if not passed:
         failure_class = "BAND_CONNECTIVITY_FAILED" if metric_checks["p95"] and not metric_checks["max"] else "QUALITY_GATE_FAILED"
 
-    fermi = parse_fermi_outcar(base / "01_scf/OUTCAR")
     plot = directory / "VASP_W90_cmp.pdf"
-    _plot_comparison(plot, dft_target, w90_target, fermi, f"{structure} / {candidate}", target_metrics)
+    _plot_comparison(
+        plot,
+        dft_target,
+        w90_target,
+        fermi,
+        f"{structure} / {candidate}",
+        target_metrics,
+        display_energy_window,
+    )
     projection = _parse_projections(directory / "wannier90.win")
     spread = wout["final_total_spread_ang2"]
     result = {
@@ -420,6 +498,13 @@ def evaluate_attempt(
         "nocc_target": target_occupied,
         "nocc_model": model_occupied,
         "fermi_eV": fermi,
+        "comparison_scope": {
+            "energy_reference": energy_reference,
+            "declared_target_energy_eV": list(target_window_declared),
+            "absolute_target_energy_eV": list(target_window_absolute),
+            "error_mask": "include points whose DFT energy lies inside the declared target window",
+            "gap_check": "indirect gap evaluated independently on the mapped target bands",
+        },
         "target_metrics": target_metrics,
         "native_model_metrics": native_metrics,
         "thresholds": thresholds,
@@ -460,6 +545,14 @@ def _is_complete_sp(projection: list[str]) -> bool:
     return bool(shells) and all({"s", "p"}.issubset(values) for values in shells.values())
 
 
+def _is_complete_shell_candidate(item: dict[str, Any]) -> bool:
+    return item.get("candidate_family") in {
+        "complete_shell_combination",
+        "all_observed_shells",
+        "explicit_optional_prior",
+    }
+
+
 def _fit_sort_key(item: dict[str, Any]) -> tuple[float, float, float, float, int]:
     metrics = item["metrics"]
     return (
@@ -469,6 +562,19 @@ def _fit_sort_key(item: dict[str, Any]) -> tuple[float, float, float, float, int
         metrics["mae_mev"],
         item["num_wann"],
     )
+
+
+def _best_attempt_per_candidate(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one best passing window/localization attempt per projection candidate."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in results:
+        if item.get("passed"):
+            grouped.setdefault(str(item["candidate"]), []).append(item)
+    selected = []
+    for candidate in sorted(grouped):
+        attempts = sorted(grouped[candidate], key=_fit_sort_key)
+        selected.append(attempts[0])
+    return selected
 
 
 def _common_attempt_ranking(
@@ -537,6 +643,8 @@ def _common_attempt_ranking(
                     for sid, member in members.items()
                 },
                 "passed": True,
+                "candidate_family": next(iter(members.values())).get("candidate_family"),
+                "integrated_weight_fraction": next(iter(members.values())).get("integrated_weight_fraction"),
             })
         if not common_attempts:
             rejected.append({"candidate": candidate, "reason": "no_common_attempt_across_structures"})
@@ -550,6 +658,7 @@ def _common_attempt_ranking(
     for rank, item in enumerate(accepted, 1):
         item["rank"] = rank
         item["complete_sp_shells"] = _is_complete_sp(item["projection"])
+        item["complete_shell_candidate"] = _is_complete_shell_candidate(item)
     return {"ranking": accepted, "rejected": rejected}
 
 
@@ -568,6 +677,7 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
         sid = str(structure["id"])
         base = root / "structures" / sid
         candidates = spec["shared_candidates"] if spec["ensemble_mode"] == "common_basis" else spec["independent_candidates"][sid]
+        candidate_metadata = {str(item["candidate"]): item for item in candidates}
         priority = [{
             "priority": index,
             "candidate": item["candidate"],
@@ -580,6 +690,7 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
         baseline = base / "05_quality/quality.json"
         if baseline.is_file():
             raw = read_json(baseline)
+            metadata = candidate_metadata.get(str(raw["candidate"]), {})
             results.append({
                 "candidate": raw["candidate"],
                 "attempt": "baseline",
@@ -592,9 +703,12 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
                 "mean_spread_per_wf_ang2": None if raw.get("final_total_spread_ang2") is None else raw["final_total_spread_ang2"] / raw["num_wann"],
                 "passed": raw["passed"],
                 "quality": str(baseline),
+                "candidate_family": metadata.get("candidate_family", "legacy_baseline"),
+                "integrated_weight_fraction": metadata.get("integrated_weight_fraction"),
             })
         for quality_path in sorted((base / "04_wannier_attempts").glob("*/attempt-*/quality.json")):
             raw = read_json(quality_path)
+            metadata = candidate_metadata.get(str(raw["candidate"]), {})
             results.append({
                 "candidate": raw["candidate"],
                 "attempt": raw["attempt"],
@@ -607,27 +721,37 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
                 "mean_spread_per_wf_ang2": raw.get("mean_spread_per_wf_ang2"),
                 "passed": raw["passed"],
                 "quality": str(quality_path),
+                "candidate_family": metadata.get("candidate_family"),
+                "integrated_weight_fraction": metadata.get("integrated_weight_fraction"),
             })
-        accepted = [item for item in results if item["passed"]]
+        accepted = _best_attempt_per_candidate(results)
         accepted.sort(key=_fit_sort_key)
         for rank, item in enumerate(accepted, 1):
             item["rank"] = rank
             item["complete_sp_shells"] = _is_complete_sp(item["projection"])
+            item["complete_shell_candidate"] = _is_complete_shell_candidate(item)
 
         optical = None
         if accepted:
             best = accepted[0]
-            practical = [item for item in accepted if item["complete_sp_shells"] and
+            practical = [item for item in accepted if item["complete_shell_candidate"] and
                          item["metrics"]["p95_mev"] <= best["metrics"]["p95_mev"] + 2.0 and
                          item["metrics"]["max_mev"] <= best["metrics"]["max_mev"] + 10.0]
-            selected = min(practical, key=lambda item: (item["num_wann"], item["rank"])) if practical else best
+            selected = min(
+                practical,
+                key=lambda item: (
+                    -float(item.get("integrated_weight_fraction") or 0.0),
+                    item["num_wann"],
+                    item["rank"],
+                ),
+            ) if practical else best
             optical = {
                 "candidate": selected["candidate"],
                 "fit_rank": selected["rank"],
                 "reason": (
-                    "complete_s_p_shells_within_practical_fit_tolerance"
-                    if selected["complete_sp_shells"] else
-                    "no_complete_sp_candidate_within_practical_fit_tolerance_use_best_fit_provisionally"
+                    "complete_observed_shell_family_within_practical_fit_tolerance"
+                    if selected["complete_shell_candidate"] else
+                    "no_complete_shell_family_within_practical_fit_tolerance_use_best_fit_provisionally"
                 ),
                 "requires_observable_convergence_check": True,
             }
@@ -636,6 +760,11 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
             "fit_ranking": accepted,
             "rejected": [item for item in results if not item["passed"]],
             "top_k": accepted[:output_top_k],
+            "top_k_status": {
+                "requested": output_top_k,
+                "available": len(accepted),
+                "complete": len(accepted) >= output_top_k,
+            },
             "optical_basis_recommendation": optical,
         }
         results_by_structure[sid] = results
@@ -647,30 +776,43 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
         best = joint["ranking"][0] if joint["ranking"] else None
         practical = [] if best is None else [
             item for item in joint["ranking"]
-            if item["complete_sp_shells"]
+            if item["complete_shell_candidate"]
             and item["pair_worst_metrics"]["p95_mev"] <= best["pair_worst_metrics"]["p95_mev"] + 2.0
             and item["pair_worst_metrics"]["max_mev"] <= best["pair_worst_metrics"]["max_mev"] + 10.0
         ]
         selected = None if best is None else (
-            min(practical, key=lambda item: (item["num_wann"], item["rank"])) if practical else best
+            min(
+                practical,
+                key=lambda item: (
+                    -float(item.get("integrated_weight_fraction") or 0.0),
+                    item["num_wann"],
+                    item["rank"],
+                ),
+            ) if practical else best
         )
         joint["optical_basis_recommendation"] = None if selected is None else {
             "candidate": selected["candidate"],
             "attempt": selected["attempt"],
             "fit_rank": selected["rank"],
             "reason": (
-                "complete_s_p_shells_within_practical_pair_worst_fit_tolerance"
-                if selected["complete_sp_shells"] else
-                "no_complete_sp_candidate_within_practical_pair_worst_fit_tolerance_use_best_fit_provisionally"
+                "complete_observed_shell_family_within_practical_pair_worst_fit_tolerance"
+                if selected["complete_shell_candidate"] else
+                "no_complete_shell_family_within_practical_pair_worst_fit_tolerance_use_best_fit_provisionally"
             ),
             "requires_observable_convergence_check": True,
         }
         joint["top_k"] = joint["ranking"][:output_top_k]
+        joint["top_k_status"] = {
+            "requested": output_top_k,
+            "available": len(joint["ranking"]),
+            "complete": len(joint["ranking"]) >= output_top_k,
+        }
     document = {
         "schema_version": 1,
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "ranking_scope": "same_declared_target_energy_window",
         "ensemble_mode": spec["ensemble_mode"],
+        "requested_top_k": output_top_k,
         "structures": structures,
         "joint_common_basis": joint,
         "interpretation": {
@@ -687,6 +829,27 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
 def export_ranked_attempts(run_dir: str | Path) -> dict[str, Any]:
     """Export small, POTCAR-free top-K packages for downstream optics."""
     root = Path(run_dir).expanduser().resolve()
+    physics: dict[str, Any] = {}
+    structure_metadata: dict[str, Any] = {}
+    snapshot = root / "project.snapshot.yaml"
+    if snapshot.is_file():
+        import yaml
+
+        with snapshot.open("r", encoding="utf-8") as handle:
+            project = yaml.safe_load(handle)
+        if isinstance(project, dict) and isinstance(project.get("physics"), dict):
+            source_physics = project["physics"]
+            for key in ("soc", "dimensionality", "axes", "energy_reference", "target_energy_eV"):
+                if key in source_physics:
+                    physics[key] = source_physics[key]
+            structure_metadata = {
+                str(item["id"]): {
+                    "structure_analysis": item.get("structure_analysis"),
+                    "meshes_resolved": item.get("meshes_resolved", {}),
+                }
+                for item in project.get("structures", [])
+                if isinstance(item, dict) and item.get("id")
+            }
     ranking_path = root / "06_rank/candidate-ranking-v04.json"
     if not ranking_path.is_file():
         raise ValueError("请先运行 rank-attempts；缺少 candidate-ranking-v04.json。")
@@ -740,6 +903,18 @@ def export_ranked_attempts(run_dir: str | Path) -> dict[str, Any]:
         attempt = str(entry["attempt"])
         rank_root = item["rank_root"]
         rank_root.mkdir(parents=True, exist_ok=True)
+        package_physics = dict(physics)
+        member_analyses = [
+            structure_metadata.get(sid, {}).get("structure_analysis")
+            for sid in item["members"]
+        ]
+        member_analyses = [value for value in member_analyses if isinstance(value, dict)]
+        dimensions = {int(value["dimensionality"]) for value in member_analyses if "dimensionality" in value}
+        periodic_axes = {tuple(value["periodic_axes"]) for value in member_analyses if "periodic_axes" in value}
+        if len(dimensions) == 1:
+            package_physics["dimensionality"] = next(iter(dimensions))
+        if len(periodic_axes) == 1:
+            package_physics["periodic_axes"] = list(next(iter(periodic_axes)))
         package = {
             "rank": rank,
             "candidate": candidate,
@@ -747,6 +922,7 @@ def export_ranked_attempts(run_dir: str | Path) -> dict[str, Any]:
             "projection": entry["projection"],
             "num_wann": entry["num_wann"],
             "nocc_model": entry["nocc_model"],
+            "physics": package_physics,
             item["metric_key"]: item["metrics"],
             "structures": {},
         }
@@ -781,6 +957,7 @@ def export_ranked_attempts(run_dir: str | Path) -> dict[str, Any]:
             files = sorted(path for path in target.iterdir() if path.is_file())
             package["structures"][sid] = {
                 "metrics": member["metrics"],
+                **structure_metadata.get(sid, {}),
                 "files": {path.name: sha256_file(path) for path in files},
             }
         atomic_json(rank_root / "package-manifest.json", package)
@@ -789,6 +966,12 @@ def export_ranked_attempts(run_dir: str | Path) -> dict[str, Any]:
         "schema_version": 1,
         "ranking": str(ranking_path),
         "ensemble_mode": ensemble_mode,
+        "requested_top_k": ranking.get("requested_top_k"),
+        "top_k_status": (
+            ranking.get("joint_common_basis", {}).get("top_k_status")
+            if ensemble_mode == "common_basis" else
+            {sid: value.get("top_k_status") for sid, value in ranking.get("structures", {}).items()}
+        ),
         "packages": packages,
         "contains_potcar": False,
     }

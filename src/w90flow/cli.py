@@ -6,23 +6,88 @@ from pathlib import Path
 from typing import Any
 
 from .config import ConfigError, load_project
+from .coldstart import run_stage1_coldstart
 from .attempts import create_attempts, import_completed_attempt, run_attempt
 from .candidates import suggest_projection_candidates
 from .executor import finalize_run, generate_candidates, import_completed_stage, prepare_run, reconcile_stage, run_vasp_stage
-from .parsers import parse_eigenval
+from .parsers import parse_eigenval, parse_poscar
 from .pipeline import audit_reference, plan_project
 from .pyw90_adapter import run_eig_suggest
 from .quality import evaluate_attempt, evaluate_run, export_ranked_attempts, rank_attempts
 from .ranking import audit_ranking_document
 from .material_pool import screen_c2db, write_material_pool
-from .orchestrator import WORKFLOW_STOPS, inspect_workflow, run_workflow
-from .state import initialize_run, read_status
+from .orchestrator import WORKFLOW_STOPS, fit_from_precomputed, fit_from_preprocess, inspect_workflow, run_workflow
+from .state import initialize_run, read_status, sha256_file
+from .preprocess import (
+    PREPROCESS_STAGES,
+    build_preprocess_plan,
+    inspect_preprocess_run,
+    normalize_preprocess_config,
+    prepare_preprocess_run,
+    reconcile_preprocess_stage,
+    recover_interrupted_stage,
+    run_preprocess_workflow,
+    standard_semilocal_preprocess,
+)
+from .structure import resolve_periodicity
 from .supervisor import inspect_supervisor, supervise_workflow
 from .windows import suggest_windows
+from .resources import candidate_search_plan, detect_resources
 
 
 def _emit(payload: Any) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _source_mappings(values: list[str]) -> dict[str, str]:
+    mappings: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError("source 必须是 STRUCTURE=/absolute/directory")
+        structure, source = value.split("=", 1)
+        if not structure or not source or structure in mappings:
+            raise ValueError("source 结构名/目录为空或结构重复。")
+        mappings[structure] = source
+    return mappings
+
+
+def _preprocess_project(config_path: str, poscar_path: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load one portable YAML file and resolve its file inputs against that file."""
+    import yaml
+
+    config_file = Path(config_path).expanduser().resolve()
+    with config_file.open("r", encoding="utf-8") as handle:
+        document = yaml.safe_load(handle) or {}
+    if not isinstance(document, dict):
+        raise ValueError("preprocess 配置根节点必须是对象。")
+    poscar = Path(poscar_path).expanduser().resolve()
+    analysis = resolve_periodicity(parse_poscar(poscar), {"dimensionality": "auto"})
+    protocol = normalize_preprocess_config(document, int(analysis["dimensionality"]))
+    inputs = document.get("preprocess_inputs")
+    if not isinstance(inputs, dict):
+        raise ValueError("preprocess 配置缺少 preprocess_inputs。")
+    resolved = json.loads(json.dumps(inputs))
+    base = config_file.parent
+
+    def resolve_file(value: str) -> str:
+        path = Path(value).expanduser()
+        return str(path.resolve() if path.is_absolute() else (base / path).resolve())
+
+    templates = resolved.get("templates")
+    if isinstance(templates, dict):
+        for stage in templates.values():
+            if isinstance(stage, dict):
+                for role in ("incar", "kpoints"):
+                    if isinstance(stage.get(role), str):
+                        stage[role] = resolve_file(stage[role])
+    potcar = resolved.get("potcar")
+    if isinstance(potcar, dict):
+        if isinstance(potcar.get("path"), str):
+            potcar["path"] = resolve_file(potcar["path"])
+        for item in potcar.get("components", []):
+            if isinstance(item, dict) and isinstance(item.get("path"), str):
+                item["path"] = resolve_file(item["path"])
+    return protocol, resolved
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,6 +117,49 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("run_dir")
     resume.add_argument("--until", choices=WORKFLOW_STOPS, default="export")
     resume.add_argument("--execute", action="store_true")
+
+    fit_bands = sub.add_parser(
+        "fit-from-bands",
+        help="从哈希等价的既有 SCF/Band 交接文件开始，自动完成 Wannier top-K",
+    )
+    fit_bands.add_argument("config")
+    fit_bands.add_argument("--runs-root", default="runs")
+    fit_bands.add_argument("--scf-source", action="append", required=True, help="STRUCTURE=/absolute/scf-directory")
+    fit_bands.add_argument("--band-source", action="append", required=True, help="STRUCTURE=/absolute/band-directory")
+    fit_bands.add_argument("--until", choices=WORKFLOW_STOPS, default="export")
+    fit_bands.add_argument("--execute", action="store_true")
+
+    fit_preprocess = sub.add_parser(
+        "fit-from-preprocess",
+        help="核验已完成的前处理交接，并用优化后结构自动进入 Wannier top-K",
+    )
+    fit_preprocess.add_argument("config")
+    fit_preprocess.add_argument("--runs-root", default="runs")
+    fit_preprocess.add_argument("--run-dir", help="可选的确定性唯一 run 路径；必须位于 runs-root 内")
+    fit_preprocess.add_argument(
+        "--preprocess-source",
+        action="append",
+        required=True,
+        help="STRUCTURE=/absolute/preprocess-run",
+    )
+    fit_preprocess.add_argument("--until", choices=WORKFLOW_STOPS, default="export")
+    fit_preprocess_mode = fit_preprocess.add_mutually_exclusive_group()
+    fit_preprocess_mode.add_argument("--execute", action="store_true")
+    fit_preprocess_mode.add_argument(
+        "--bootstrap-only",
+        action="store_true",
+        help="只创建一次 Wannier run 并导入 SCF/Band；随后必须 resume 同一 run_dir",
+    )
+
+    coldstart = sub.add_parser(
+        "stage1-coldstart",
+        help="从优化好的 POSCAR 无人值守推进 SCF/Band/有限 Wannier 候选/Top-K",
+    )
+    coldstart.add_argument("config")
+    coldstart.add_argument("--campaign-dir", required=True)
+    coldstart.add_argument("--runs-root", default="/private/tmp/LocalVASP-mount/runs/w90flow")
+    coldstart.add_argument("--poll-seconds", type=float, default=30.0)
+    coldstart.add_argument("--execute", action="store_true")
 
     inspect = sub.add_parser("inspect", help="只读显示自动状态机的下一动作")
     inspect.add_argument("run_dir")
@@ -85,6 +193,12 @@ def build_parser() -> argparse.ArgumentParser:
     candidates = sub.add_parser("candidate-suggest", help="由目标能区积分轨道权重产生有限嵌套候选")
     candidates.add_argument("scores_json", help="含 orbital_scores、element_counts、chemical_valence 的 JSON")
     candidates.add_argument("--soc", action="store_true")
+
+    resources = sub.add_parser("resource-plan", help="探测本机/Slurm 核数和候选并行方案；不启动计算")
+    resources.add_argument("--candidates", type=int, required=True)
+    resources.add_argument("--mpi-per-candidate", type=int, required=True)
+    resources.add_argument("--policy", choices=("serial", "candidate_parallel"), default="serial")
+    resources.add_argument("--max-workers", default="auto")
 
     pyw90 = sub.add_parser("pyw90-baseline", help="将 PyW90 eig suggest 转为可审计 JSON 对照")
     pyw90.add_argument("eigenval")
@@ -157,6 +271,54 @@ def build_parser() -> argparse.ArgumentParser:
     material_pool.add_argument("database")
     material_pool.add_argument("config", help="材料池筛选 YAML")
     material_pool.add_argument("--output-dir", required=True)
+
+    preprocess_profile = sub.add_parser(
+        "preprocess-profile",
+        help="从 POSCAR+SOC 生成非磁性半局域 relax→SCF→Band 冻结协议；不启动 VASP",
+    )
+    preprocess_profile.add_argument("poscar")
+    soc_group = preprocess_profile.add_mutually_exclusive_group(required=True)
+    soc_group.add_argument("--soc", dest="soc", action="store_true")
+    soc_group.add_argument("--no-soc", dest="soc", action="store_false")
+    preprocess_profile.add_argument("--no-relax", action="store_true")
+    preprocess_profile.add_argument("--relax-with-soc", action="store_true")
+    preprocess_profile.add_argument(
+        "--band-path-provider",
+        choices=("template", "seekpath", "ase", "vaspkit"),
+        default="ase",
+    )
+
+    preprocess_prepare = sub.add_parser(
+        "preprocess-prepare",
+        help="物化不可覆盖的 Relax→SCF→Band 输入；不启动 VASP",
+    )
+    preprocess_prepare.add_argument("poscar")
+    preprocess_prepare.add_argument("config", help="含 preprocess 与 preprocess_inputs 的 YAML")
+    preprocess_prepare.add_argument("--run-dir", required=True)
+
+    preprocess_inspect = sub.add_parser("preprocess-inspect", help="只读查看前处理下一动作")
+    preprocess_inspect.add_argument("run_dir")
+
+    preprocess_run = sub.add_parser(
+        "preprocess-run",
+        help="从断点推进 Relax→SCF→Band；默认只预览，--execute 才启动",
+    )
+    preprocess_run.add_argument("run_dir")
+    preprocess_run.add_argument("--execute", action="store_true")
+
+    preprocess_recover = sub.add_parser(
+        "preprocess-recover",
+        help="仅清理同主机已死亡 PID 的阶段锁；不提交作业",
+    )
+    preprocess_recover.add_argument("run_dir")
+    preprocess_recover.add_argument("stage", choices=PREPROCESS_STAGES)
+
+    preprocess_reconcile = sub.add_parser(
+        "preprocess-reconcile",
+        help="验收外部/中断后已完整输出并应用哈希交接；不提交作业",
+    )
+    preprocess_reconcile.add_argument("run_dir")
+    preprocess_reconcile.add_argument("stage", choices=PREPROCESS_STAGES)
     return parser
 
 
@@ -175,6 +337,17 @@ def main(argv: list[str] | None = None) -> int:
             _emit(read_status(args.run_dir))
         elif args.command in {"run", "resume"}:
             result = run_workflow(args.run_dir, execute=args.execute, until=args.until)
+            _emit(result)
+            return 0 if result.get("passed") or not args.execute else 1
+        elif args.command == "fit-from-bands":
+            result = fit_from_precomputed(
+                load_project(args.config),
+                args.runs_root,
+                _source_mappings(args.scf_source),
+                _source_mappings(args.band_source),
+                execute=args.execute,
+                until=args.until,
+            )
             _emit(result)
             return 0 if result.get("passed") or not args.execute else 1
         elif args.command == "inspect":
@@ -198,6 +371,28 @@ def main(argv: list[str] | None = None) -> int:
             result = audit_reference(args.example_dir)
             _emit(result)
             return 0 if result.get("passed") else 1
+        elif args.command == "fit-from-preprocess":
+            result = fit_from_preprocess(
+                load_project(args.config),
+                args.runs_root,
+                _source_mappings(args.preprocess_source),
+                execute=args.execute,
+                bootstrap_only=args.bootstrap_only,
+                run_dir=args.run_dir,
+                until=args.until,
+            )
+            _emit(result)
+            return 0 if result.get("passed") or not args.execute else 1
+        elif args.command == "stage1-coldstart":
+            result = run_stage1_coldstart(
+                args.config,
+                args.campaign_dir,
+                args.runs_root,
+                execute=args.execute,
+                poll_seconds=args.poll_seconds,
+            )
+            _emit(result)
+            return 0 if (not args.execute or result.get("status") == "COMPLETE") else 1
         elif args.command == "audit-ranking":
             with Path(args.ranking_json).open("r", encoding="utf-8") as handle:
                 result = audit_ranking_document(json.load(handle))
@@ -220,6 +415,17 @@ def main(argv: list[str] | None = None) -> int:
                 args.soc,
                 scores.get("chemical_valence"),
             )})
+        elif args.command == "resource-plan":
+            raw_workers: int | str = args.max_workers
+            if raw_workers != "auto":
+                raw_workers = int(raw_workers)
+            _emit(candidate_search_plan(
+                available=detect_resources(),
+                candidate_count=args.candidates,
+                mpi_processes_per_candidate=args.mpi_per_candidate,
+                policy=args.policy,
+                max_workers=raw_workers,
+            ))
         elif args.command == "pyw90-baseline":
             _emit(run_eig_suggest(
                 args.eigenval,
@@ -239,14 +445,7 @@ def main(argv: list[str] | None = None) -> int:
             _emit(result)
             return 0 if result.get("passed") else 1
         elif args.command == "import-stage":
-            mappings: dict[str, str] = {}
-            for value in args.source:
-                if "=" not in value:
-                    raise ValueError("--source 必须是 STRUCTURE=/absolute/directory")
-                structure, source = value.split("=", 1)
-                if not structure or not source or structure in mappings:
-                    raise ValueError("--source 结构名/目录为空或结构重复。")
-                mappings[structure] = source
+            mappings = _source_mappings(args.source)
             result = import_completed_stage(args.run_dir, args.stage, mappings)
             _emit(result)
             return 0 if result.get("passed") else 1
@@ -288,6 +487,52 @@ def main(argv: list[str] | None = None) -> int:
                 pool_config = yaml.safe_load(handle) or {}
             document = screen_c2db(args.database, pool_config)
             _emit({**write_material_pool(document, args.output_dir), "selected_count": document["selected_count"]})
+        elif args.command == "preprocess-profile":
+            poscar_path = Path(args.poscar).expanduser().resolve()
+            parsed = parse_poscar(poscar_path)
+            analysis = resolve_periodicity(parsed, {"dimensionality": "auto"})
+            protocol = standard_semilocal_preprocess(
+                soc=args.soc,
+                dimensionality=int(analysis["dimensionality"]),
+                periodic_axes=list(analysis["periodic_axes"]),
+                relaxation_enabled=not args.no_relax,
+                relaxation_soc=args.relax_with_soc,
+                band_path_provider=args.band_path_provider,
+            )
+            _emit({
+                "source": {"POSCAR": str(poscar_path), "sha256": sha256_file(poscar_path)},
+                "structure_analysis": analysis,
+                "protocol": protocol,
+                "plan": build_preprocess_plan(protocol),
+                "execution": "DRY_RUN_ONLY",
+            })
+        elif args.command == "preprocess-prepare":
+            protocol, inputs = _preprocess_project(args.config, args.poscar)
+            required = {"templates", "potcar", "commands"}
+            missing = sorted(required - set(inputs))
+            if missing:
+                raise ValueError(f"preprocess_inputs 缺少：{', '.join(missing)}")
+            run = prepare_preprocess_run(
+                args.run_dir,
+                args.poscar,
+                protocol,
+                templates=inputs["templates"],
+                potcar=inputs["potcar"],
+                commands=inputs["commands"],
+            )
+            _emit({"prepared": str(run), "status": inspect_preprocess_run(run), "execution": "NOT_STARTED"})
+        elif args.command == "preprocess-inspect":
+            _emit(inspect_preprocess_run(args.run_dir))
+        elif args.command == "preprocess-run":
+            result = run_preprocess_workflow(args.run_dir, execute=args.execute)
+            _emit(result)
+            return 0 if result.get("passed") or not args.execute else 1
+        elif args.command == "preprocess-recover":
+            _emit(recover_interrupted_stage(args.run_dir, args.stage))
+        elif args.command == "preprocess-reconcile":
+            result = reconcile_preprocess_stage(args.run_dir, args.stage)
+            _emit(result)
+            return 0 if result.get("passed") else 1
         return 0
     except (ConfigError, OSError, PermissionError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
         _emit({"error": str(exc), "type": type(exc).__name__})

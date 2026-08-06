@@ -4,6 +4,8 @@ import json
 import os
 import shutil
 import socket
+import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,10 +13,12 @@ from typing import Any
 import yaml
 
 from .attempts import create_attempts, recorded_or_classified_failure, run_attempt
-from .executor import generate_candidates, reconcile_stage, run_vasp_stage
-from .parsers import parse_wout
-from .quality import evaluate_attempt, export_ranked_attempts, rank_attempts
-from .state import atomic_json, read_json, read_status, update_stage
+from .executor import generate_candidates, import_completed_stage, prepare_run, reconcile_stage, run_vasp_stage
+from .parsers import parse_poscar, parse_wout
+from .structure import resolve_periodicity, resolve_uniform_mesh
+from .quality import IncompleteTargetSubspace, evaluate_attempt, export_ranked_attempts, rank_attempts
+from .state import atomic_json, read_json, read_status, sha256_file, update_stage
+from .resources import candidate_search_plan, detect_resources
 
 
 WORKFLOW_STOPS = ("scf", "band", "candidates", "wannier", "quality", "rank", "export")
@@ -143,6 +147,160 @@ def inspect_workflow(run_dir: str | Path) -> dict[str, Any]:
     }
 
 
+def fit_from_precomputed(
+    config: dict[str, Any],
+    runs_root: str | Path,
+    scf_sources: dict[str, str | Path],
+    band_sources: dict[str, str | Path],
+    *,
+    execute: bool = False,
+    bootstrap_only: bool = False,
+    run_dir: str | Path | None = None,
+    until: str = "export",
+) -> dict[str, Any]:
+    """Bootstrap the deterministic Wannier search from verified SCF/Band data."""
+    if execute and bootstrap_only:
+        raise ValueError("execute 与 bootstrap_only 不能同时启用。")
+    expected = {str(item["id"]) for item in config["structures"]}
+    if set(scf_sources) != expected or set(band_sources) != expected:
+        raise ValueError("SCF/Band source 映射必须恰好覆盖 project 中的全部结构。")
+    contract = {
+        "scf_required": ["POSCAR", "POTCAR", "INCAR", "KPOINTS", "OUTCAR", "OSZICAR", "CHGCAR", "EIGENVAL"],
+        "band_required": ["POSCAR", "POTCAR", "INCAR", "KPOINTS", "CHGCAR", "OUTCAR", "EIGENVAL", "PROCAR", "vasprun.xml"],
+        "hash_policy": "SCF verifies four prepared inputs; Band additionally verifies CHGCAR",
+        "next": "candidate generation -> finite Wannier attempts -> quality -> rank -> export",
+    }
+    if not execute and not bootstrap_only:
+        return {
+            "mode": "DRY_RUN",
+            "project": config["project"],
+            "until": until,
+            "contract": contract,
+            "scf_sources": {key: str(value) for key, value in scf_sources.items()},
+            "band_sources": {key: str(value) for key, value in band_sources.items()},
+        }
+    run = prepare_run(config, runs_root, run_dir=run_dir)
+    scf_import = import_completed_stage(run, "scf", scf_sources)
+    band_import = import_completed_stage(run, "band", band_sources)
+    if bootstrap_only:
+        return {
+            "mode": "BOOTSTRAPPED",
+            "run_dir": str(run),
+            "contract": contract,
+            "scf_import": scf_import,
+            "band_import": band_import,
+            "passed": False,
+            "next": "persist run_dir, then resume this exact run with --execute",
+        }
+    result = run_workflow(run, execute=True, until=until)
+    return {
+        "run_dir": str(run),
+        "contract": contract,
+        "scf_import": scf_import,
+        "band_import": band_import,
+        "workflow": result,
+        "passed": bool(result.get("passed")),
+    }
+
+
+def fit_from_preprocess(
+    config: dict[str, Any],
+    runs_root: str | Path,
+    preprocess_sources: dict[str, str | Path],
+    *,
+    execute: bool = False,
+    bootstrap_only: bool = False,
+    run_dir: str | Path | None = None,
+    until: str = "export",
+) -> dict[str, Any]:
+    """Verify completed preprocess handoffs and enter the Wannier state machine.
+
+    The optimized POSCAR can change lattice vectors, periodicity evidence and
+    reciprocal meshes.  Those derived fields are therefore recomputed here;
+    the original project YAML is never edited in place.
+    """
+    expected = {str(item["id"]) for item in config["structures"]}
+    if set(preprocess_sources) != expected:
+        raise ValueError("preprocess source 映射必须恰好覆盖 project 中的全部结构。")
+    rebound = copy.deepcopy(config)
+    scf_sources: dict[str, str] = {}
+    band_sources: dict[str, str] = {}
+    handoffs: dict[str, Any] = {}
+    dimensions: set[int] = set()
+    for structure in rebound["structures"]:
+        sid = str(structure["id"])
+        source = Path(preprocess_sources[sid]).expanduser().resolve()
+        protocol_path = source / "protocol.json"
+        handoff_path = source / "03_band/band-handoff.json"
+        if not protocol_path.is_file() or not handoff_path.is_file():
+            raise ValueError(f"{sid} 的 preprocess 尚无完整 protocol/band handoff：{source}")
+        protocol = read_json(protocol_path)
+        handoff = read_json(handoff_path)
+        requested_soc = bool(rebound["physics"].get("soc"))
+        if bool(protocol["soc"]["scf"]) != requested_soc or bool(protocol["soc"]["band"]) != requested_soc:
+            raise ValueError(f"{sid} 的 preprocess SCF/Band SOC 与 Stage-1 physics.soc 不一致。")
+        optimized = source / "02_scf/POSCAR"
+        if not optimized.is_file():
+            raise ValueError(f"{sid} 缺少优化后/冻结的 SCF POSCAR：{optimized}")
+        files = handoff.get("files")
+        if not isinstance(files, dict):
+            raise ValueError(f"{sid} 的 band-handoff.json 缺少 files 哈希。")
+        for name, record in files.items():
+            path = source / "03_band" / name
+            if not isinstance(record, dict) or record.get("path") != str(path) or not isinstance(record.get("sha256"), str):
+                raise ValueError(f"{sid} 的 Band handoff 记录无效：{name}")
+            if not path.is_file() or sha256_file(path) != record["sha256"]:
+                raise ValueError(f"{sid} 的 Band handoff 文件缺失或哈希改变：{name}")
+        parsed = parse_poscar(optimized)
+        analysis = resolve_periodicity(parsed, rebound["physics"])
+        structure["poscar_resolved"] = str(optimized)
+        structure["structure_analysis"] = analysis
+        # SCF/Band are immutable, hash-verified handoffs.  Their exact KPOINTS
+        # must be copied instead of regenerated from an equivalent mesh.
+        structure["preserve_precomputed_inputs"] = True
+        dimensions.add(int(analysis["dimensionality"]))
+        meshes = rebound.get("meshes", {})
+        resolved_meshes: dict[str, list[int]] = {}
+        for role, specification in {
+            "scf": meshes.get("scf"),
+            "wannier": meshes.get("wannier", meshes.get("screening")),
+            "production": meshes.get("production"),
+        }.items():
+            if specification is not None:
+                resolved_meshes[role] = resolve_uniform_mesh(
+                    specification,
+                    parsed["lattice_angstrom"],
+                    analysis["periodic_axes"],
+                )
+        structure["meshes_resolved"] = resolved_meshes
+        for stage, directory in (("scf", source / "02_scf"), ("band", source / "03_band")):
+            rebound["templates"][stage]["incar_resolved"] = str(directory / "INCAR")
+            rebound["templates"][stage]["kpoints_resolved"] = str(directory / "KPOINTS")
+        scf_sources[sid] = str(source / "02_scf")
+        band_sources[sid] = str(source / "03_band")
+        handoffs[sid] = {
+            "preprocess_run": str(source),
+            "protocol_sha256": protocol["protocol_sha256"],
+            "band_handoff": str(handoff_path),
+            "optimized_poscar_sha256": sha256_file(optimized),
+            "structure_analysis": analysis,
+            "meshes_resolved": resolved_meshes,
+        }
+    if rebound.get("ensemble", {}).get("mode") == "common_basis" and len(dimensions) != 1:
+        raise ValueError("共同基底的 preprocess 结构必须具有相同 dimensionality。")
+    result = fit_from_precomputed(
+        rebound,
+        runs_root,
+        scf_sources,
+        band_sources,
+        execute=execute,
+        bootstrap_only=bootstrap_only,
+        run_dir=run_dir,
+        until=until,
+    )
+    return {**result, "preprocess_handoffs": handoffs}
+
+
 def _attempt_complete(directory: Path) -> bool:
     required = ("wannier90.wout", "wannier90_hr.dat", "wannier90_centres.xyz", "wannier90_band.dat")
     if not all((directory / name).is_file() for name in required):
@@ -193,16 +351,48 @@ def _retry_reason(record: dict[str, Any]) -> str:
     return str(plan.get("retry_reason") or "seed")
 
 
-def choose_retry_reason(failures: list[str | None], attempted_reasons: set[str]) -> str | None:
+def _retry_class(record: dict[str, Any]) -> str:
+    plan = record.get("plan_reference", record.get("plan", {}))
+    if plan.get("mode") == "exact":
+        return "exact"
+    declared = plan.get("retry_class")
+    if declared:
+        return str(declared)
+    reason = str(plan.get("retry_reason") or "seed")
+    if reason.startswith("outer_window_expansion"):
+        return "outer_window_expansion"
+    if reason.startswith("convergence_retry"):
+        return "convergence_retry"
+    return reason
+
+
+def _retry_index(record: dict[str, Any]) -> int:
+    plan = record.get("plan_reference", record.get("plan", {}))
+    return int(plan.get("retry_index") or 0)
+
+
+def choose_retry_reason(
+    failures: list[str | None],
+    attempted_reasons: set[str],
+    available_classes: set[str] | None = None,
+) -> str | None:
     """Choose one finite deterministic branch; never relax quality thresholds."""
     clean = {failure for failure in failures if failure}
     if "NUMERIC_FAILURE" in clean:
         raise WorkflowBlocked("数值失败不能通过自动放宽科学参数处理。")
     if "INFRASTRUCTURE_FAILURE" in clean:
         return "same"
-    if clean & CONVERGENCE_FAILURES and "convergence_retry" not in attempted_reasons:
+    if clean & CONVERGENCE_FAILURES and (
+        "convergence_retry" in available_classes
+        if available_classes is not None
+        else "convergence_retry" not in attempted_reasons
+    ):
         return "convergence_retry"
-    if clean & WINDOW_FAILURES and "outer_window_expansion" not in attempted_reasons:
+    if clean & WINDOW_FAILURES and (
+        "outer_window_expansion" in available_classes
+        if available_classes is not None
+        else "outer_window_expansion" not in attempted_reasons
+    ):
         return "outer_window_expansion"
     return None
 
@@ -216,7 +406,30 @@ def _evaluate_pass_records(root: Path, structures: list[str], candidate: str, at
     for sid in structures:
         directory, record = _attempt_records(root, sid, candidate)[attempt]
         if record.get("status") == "PASS":
-            evaluate_attempt(root, sid, candidate, attempt)
+            try:
+                evaluate_attempt(root, sid, candidate, attempt)
+            except IncompleteTargetSubspace as exc:
+                rejection = {
+                    "schema_version": 1,
+                    "passed": False,
+                    "structure": sid,
+                    "candidate": candidate,
+                    "attempt": attempt,
+                    "failure_class": "INCOMPLETE_TARGET_SUBSPACE",
+                    "target_band_count": exc.target_band_count,
+                    "model_dimension": exc.model_dimension,
+                    "reason": str(exc),
+                    "quality_gate": "model_dimension_must_cover_protected_target_manifold",
+                }
+                quality_path = directory / "quality.json"
+                atomic_json(quality_path, rejection)
+                record.update({
+                    "status": "REJECTED_QUALITY",
+                    "quality_evaluated_utc": _utc_now(),
+                    "quality": str(quality_path),
+                    "failure_class": "INCOMPLETE_TARGET_SUBSPACE",
+                })
+                atomic_json(directory / "attempt.json", record)
 
 
 def _common_attempt_passed(root: Path, structures: list[str], candidate: str, attempt: str) -> bool:
@@ -228,6 +441,8 @@ def _process_candidate(
     root: Path,
     structures: list[str],
     candidate: str,
+    *,
+    mpi_processes: int | None = None,
 ) -> dict[str, Any]:
     attempted_reasons: set[str] = set()
     previous_failures: list[str | None] = []
@@ -248,6 +463,9 @@ def _process_candidate(
             reason = _retry_reason(group[0])
             if any(_retry_reason(item) != reason for item in group):
                 raise WorkflowBlocked(f"{candidate}/{label} 在相关结构间使用了不同计划。")
+            retry_class = _retry_class(group[0])
+            if any(_retry_class(item) != retry_class for item in group):
+                raise WorkflowBlocked(f"{candidate}/{label} 在相关结构间使用了不同重试类别。")
             statuses = {str(item.get("status")) for item in group}
             if group_has_runnable_member(statuses):
                 ready[label] = group
@@ -275,11 +493,21 @@ def _process_candidate(
                     if retryable:
                         selected = last_label
                     else:
-                        desired = choose_retry_reason(previous_failures, attempted_reasons)
-                        selected = next((label for label, group in ready.items() if _retry_reason(group[0]) == desired), "")
+                        available = {_retry_class(group[0]) for group in ready.values()}
+                        desired = choose_retry_reason(previous_failures, attempted_reasons, available)
+                        selected = min(
+                            (label for label, group in ready.items() if _retry_class(group[0]) == desired),
+                            key=lambda label: (_retry_index(ready[label][0]), label),
+                            default="",
+                        )
                 else:
-                    desired = choose_retry_reason(previous_failures, attempted_reasons)
-                    selected = next((label for label, group in ready.items() if _retry_reason(group[0]) == desired), "")
+                    available = {_retry_class(group[0]) for group in ready.values()}
+                    desired = choose_retry_reason(previous_failures, attempted_reasons, available)
+                    selected = min(
+                        (label for label, group in ready.items() if _retry_class(group[0]) == desired),
+                        key=lambda label: (_retry_index(ready[label][0]), label),
+                        default="",
+                    )
             else:
                 selected = ""
             if not selected:
@@ -298,7 +526,7 @@ def _process_candidate(
                 and recorded_or_classified_failure(record, directory) == "INFRASTRUCTURE_FAILURE"
                 and not list(record.get("execution_history", []))
             ):
-                result = run_attempt(root, sid, candidate, selected, execute=True)
+                result = run_attempt(root, sid, candidate, selected, execute=True, mpi_processes=mpi_processes)
                 if not result.get("passed") and result["attempt"].get("failure_class") == "NUMERIC_FAILURE":
                     raise WorkflowBlocked(f"{sid}/{candidate}/{selected} 数值失败。")
 
@@ -334,6 +562,39 @@ def _accepted_coverage(root: Path, config: dict[str, Any], spec: dict[str, Any])
         common = set()
         passed = all(accepted[sid] for sid in structures)
     return {"passed": passed, "accepted": accepted, "common": sorted(common)}
+
+
+def _run_candidate_search(
+    root: Path,
+    config: dict[str, Any],
+    spec: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run independent candidate directories serially or with bounded workers."""
+    layout = _candidate_layout(config, spec)
+    settings = config.get("execution", {}).get("candidate_search", {})
+    plan = candidate_search_plan(
+        available=detect_resources(),
+        candidate_count=len(layout),
+        mpi_processes_per_candidate=int(settings.get("mpi_processes_per_candidate", config["backend"]["mpi_processes"])),
+        policy=str(settings.get("policy", "serial")),
+        max_workers=settings.get("max_workers", "auto"),
+    )
+    mpi = int(plan["mpi_processes_per_candidate"])
+    if int(plan["workers"]) == 1:
+        return ([{"structures": structures, **_process_candidate(root, structures, candidate, mpi_processes=mpi)}
+                 for structures, candidate in layout], plan)
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=int(plan["workers"]), thread_name_prefix="w90-candidate") as pool:
+        futures = {
+            pool.submit(_process_candidate, root, structures, candidate, mpi_processes=mpi): (structures, candidate)
+            for structures, candidate in layout
+        }
+        for future in as_completed(futures):
+            structures, candidate = futures[future]
+            results.append({"structures": structures, **future.result()})
+    order = {(tuple(structures), candidate): index for index, (structures, candidate) in enumerate(layout)}
+    results.sort(key=lambda item: order[(tuple(item["structures"]), str(item["candidate"]))])
+    return results, plan
 
 
 def _ensure_vasp_stage(root: Path, stage: str, events: list[dict[str, Any]]) -> None:
@@ -415,17 +676,14 @@ def run_workflow(run_dir: str | Path, *, execute: bool = False, until: str = "ex
                 create_attempts(root)
                 events.append({"stage": "wannier", "action": "planned_attempts"})
             spec = read_json(root / "03_candidates/candidate-spec.json")
-            candidate_results = []
-            for structures, candidate in _candidate_layout(config, spec):
-                result = _process_candidate(root, structures, candidate)
-                candidate_results.append({"structures": structures, **result})
+            candidate_results, resource_plan = _run_candidate_search(root, config, spec)
             coverage = _accepted_coverage(root, config, spec)
             if not coverage["passed"]:
                 update_stage(root, "04_wannier", status="FAIL", finished_utc=_utc_now(), outputs=candidate_results)
                 raise WorkflowBlocked("有限候选/能窗尝试结束后仍没有覆盖全部结构的合格 Wannier 表示。")
             update_stage(root, "04_wannier", status="PASS", finished_utc=_utc_now(), outputs=candidate_results)
             update_stage(root, "05_quality", status="PASS", finished_utc=_utc_now(), outputs=[coverage])
-            events.append({"stage": "wannier", "action": "finite_search_complete", "coverage": coverage})
+            events.append({"stage": "wannier", "action": "finite_search_complete", "coverage": coverage, "resource_plan": resource_plan})
             if until in {"wannier", "quality"}:
                 raise StopIteration
 

@@ -1,0 +1,14 @@
+ EDIFF = 1.0E-6
+ NELM = 80
+ LSORBIT = F
+ NSW = 100
+ ISIF = 2
+ EDIFFG = -0.01
+ aborting loop because EDIFF is reached
+ POSITION                                       TOTAL-FORCE (eV/Angst)
+ -----------------------------------------------------------------------------------
+ 0.0 0.0 10.0 0.005 0.0 0.0
+ -----------------------------------------------------------------------------------
+ reached required accuracy - stopping structural energy minimisation
+ General timing and accounting informations for this job:
+

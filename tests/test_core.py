@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -10,19 +11,22 @@ from pathlib import Path
 from unittest import mock
 
 from w90flow.config import load_project
-from w90flow.attempts import classify_failure, import_completed_attempt, materialize_plan_energy_reference, plan_candidate, recorded_or_classified_failure
-from w90flow.candidates import num_wann_from_projection, suggest_projection_candidates
+from w90flow.attempts import build_standalone_w90_input, canonicalize_standalone_w90_kpoints, classify_failure, import_completed_attempt, materialize_plan_energy_reference, plan_candidate, reconcile_mmn_neighbour_cells, recorded_or_classified_failure
+from w90flow.candidates import normalize_projection, num_wann_from_projection, suggest_projection_candidates
 from w90flow.dataset import make_attempt_record
+from w90flow.executor import _build_potcar
 from w90flow.material_pool import screen_c2db
-from w90flow.orchestrator import RunLock, WorkflowBlocked, choose_retry_reason, group_has_runnable_member, inspect_workflow, run_workflow
+from w90flow.orchestrator import RunLock, WorkflowBlocked, choose_retry_reason, fit_from_precomputed, group_has_runnable_member, inspect_workflow, run_workflow
 from w90flow.parsers import parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_procar_orbital_scores
-from w90flow.quality import _best_contiguous_w90_slice, _common_attempt_ranking, _is_complete_sp, export_ranked_attempts
+from w90flow.quality import IncompleteTargetSubspace, _best_attempt_per_candidate, _best_contiguous_w90_slice, _common_attempt_ranking, _is_complete_sp, band_metrics, export_ranked_attempts
 from w90flow.pipeline import audit_reference, plan_project
-from w90flow.pyw90_adapter import parse_eig_suggest_output
+from w90flow.pyw90_adapter import element_projection_envelope, parse_eig_suggest_output, parse_pre_dos_output
 from w90flow.ranking import Thresholds, audit_ranking_document, rank_common_candidates
 from w90flow.state import initialize_run, read_status, update_stage
 from w90flow.supervisor import ProgressWatch, SupervisorLock, inspect_supervisor, progress_fingerprint, supervise_workflow
+from w90flow.structure import generate_ase_band_path, patch_wannier_uniform_grid, resolve_periodicity, resolve_uniform_mesh
 from w90flow.windows import minimum_outer_max, validate_frozen_window, validate_outer_window, validate_window_containment
+from w90flow.resources import candidate_search_plan, detect_resources
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -31,6 +35,40 @@ REFERENCE_ROOT_VALUE = os.environ.get("W90FLOW_REFERENCE_ROOT")
 EXAMPLES = Path(REFERENCE_ROOT_VALUE).expanduser().resolve() if REFERENCE_ROOT_VALUE else None
 HAS_REFERENCE_FIXTURES = EXAMPLES is not None and EXAMPLES.is_dir()
 CONFIG = FIXTURES / "project/pair-example.yaml"
+
+
+class ResourcePlanTests(unittest.TestCase):
+    def test_scheduler_allocation_and_parallel_split(self) -> None:
+        detected = detect_resources({
+            "SLURM_JOB_ID": "123",
+            "SLURM_CPUS_ON_NODE": "32",
+            "SLURM_CPUS_PER_TASK": "32",
+            "SLURM_MEM_PER_NODE": "128000",
+        })
+        self.assertEqual(detected["available_cpus"], 32)
+        plan = candidate_search_plan(
+            available=detected,
+            candidate_count=7,
+            mpi_processes_per_candidate=8,
+            policy="candidate_parallel",
+        )
+        self.assertEqual(plan["workers"], 4)
+        self.assertEqual(plan["allocated_cpus_used"], 32)
+
+    def test_low_memory_machine_stays_single_worker(self) -> None:
+        available = {
+            "available_cpus": 8,
+            "memory_gib": 8.0,
+            "scheduler_allocation": False,
+            "sources": {},
+        }
+        plan = candidate_search_plan(
+            available=available,
+            candidate_count=4,
+            mpi_processes_per_candidate=4,
+            policy="candidate_parallel",
+        )
+        self.assertEqual(plan["workers"], 1)
 
 
 class ParserTests(unittest.TestCase):
@@ -50,11 +88,98 @@ There are at most 4 states and at least 2 states in [-4.6, -0.5].
         self.assertEqual(parsed["outer_window_suggestions"][0]["nmost"], 4)
         self.assertEqual(parsed["frozen_window_suggestions"][0]["states"], 8)
 
+    def test_pyw90_pre_dos_projection_parser(self) -> None:
+        parsed = parse_pre_dos_output(
+            """\x1b[31mFermi level : -3.27340 eV\x1b[0m
+DOS Gap     : 1.31030 eV
+Number of WFs selected: 28 (with degeneracy 2)
+Wannier90 Projection:
+In:l=0;l=1
+Se:l=1
+
+pyw90 --extra input:
+In,0-1,0-3;Se,2-3,1-3
+"""
+        )
+        self.assertEqual(parsed["projection"], ["In:s", "In:p", "Se:p"])
+        self.assertEqual(parsed["num_wann_selected"], 28)
+        self.assertEqual(parsed["degeneracy"], 2)
+        self.assertAlmostEqual(parsed["dos_gap_eV"], 1.3103)
+        represented = element_projection_envelope(parsed, {"In": 2, "Se": 2})
+        self.assertEqual(represented["projection"], ["In:s", "In:p", "Se:p"])
+        self.assertEqual(represented["representation"], "exact_element_level")
+
+    def test_pyw90_pre_dos_component_projection_parser(self) -> None:
+        parsed = parse_pre_dos_output(
+            """Number of WFs selected: 20 (with degeneracy 2)
+Wannier90 Projection:
+In:l=0;px;py
+Se:py;px
+
+pyw90 --extra input:
+In,0-1,0-1|3;Se,2-3,1|3
+"""
+        )
+        self.assertEqual(parsed["projection"], ["In:s", "In:px", "In:py", "Se:py", "Se:px"])
+        self.assertEqual(
+            num_wann_from_projection(parsed["projection"], {"In": 2, "Se": 2}, True),
+            20,
+        )
+
+    def test_pyw90_site_specific_advice_becomes_audited_element_envelope(self) -> None:
+        parsed = parse_pre_dos_output(
+            """Number of WFs selected: 8 (with degeneracy 1)
+Wannier90 Projection:
+f=0.000000,0.500000,0.572750:py;px
+f=0.500000,0.000000,0.427250:l=1
+Si:l=1
+
+pyw90 --extra input:
+S,1,1|3;S,2,1-3;Si,0,1-3
+"""
+        )
+        represented = element_projection_envelope(parsed, {"Si": 1, "S": 2})
+        self.assertEqual(represented["projection"], ["Si:p", "S:p"])
+        self.assertEqual(represented["representation"], "element_level_envelope")
+        self.assertFalse(represented["site_uniform"])
+        self.assertEqual(num_wann_from_projection(represented["projection"], {"Si": 1, "S": 2}, False), 9)
+
     def test_final_fermi_parser(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             outcar = Path(temporary) / "OUTCAR"
             outcar.write_text(" E-fermi : 1.25 eV\n E-fermi : 2.75 eV\n", encoding="utf-8")
             self.assertEqual(parse_fermi_outcar(outcar), 2.75)
+
+    def test_potcar_registry_label_can_differ_from_poscar_element(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry = root / "registry"
+            component = registry / "Zr_sv/POTCAR"
+            component.parent.mkdir(parents=True)
+            component.write_bytes(b"synthetic Zr_sv POTCAR\n")
+            component_hash = hashlib.sha256(component.read_bytes()).hexdigest()
+            lock = root / "POTCAR_LOCK.json"
+            lock.write_text(json.dumps({
+                "registry": str(registry),
+                "sets": {
+                    "Zr_sv_test": {
+                        "order": ["Zr"],
+                        "labels": {"Zr": "Zr_sv"},
+                        "component_sha256": {"Zr": component_hash},
+                        "combined_sha256": component_hash,
+                    }
+                },
+            }), encoding="utf-8")
+            output = root / "POTCAR"
+            result = _build_potcar(
+                {"pseudopotentials": {"lock_resolved": str(lock)}},
+                "Zr_sv_test",
+                ["Zr"],
+                output,
+            )
+            self.assertEqual(output.read_bytes(), component.read_bytes())
+            self.assertEqual(result["components"][0]["element"], "Zr")
+            self.assertEqual(result["components"][0]["registry_label"], "Zr_sv")
 
     @unittest.skipUnless(HAS_REFERENCE_FIXTURES, "set W90FLOW_REFERENCE_ROOT for licensed/large reference fixtures")
     def test_real_eigenval_and_hr(self) -> None:
@@ -73,6 +198,63 @@ There are at most 4 states and at least 2 states in [-4.6, -0.5].
         scores = parse_procar_orbital_scores(example / "02_band/PROCAR", poscar, -4.6, -0.5)
         self.assertGreater(scores["selected_state_count"], 0)
         self.assertGreater(sum(value for key, value in scores["orbital_scores"].items() if key.endswith(":p")), 0.8)
+
+
+class StructureTests(unittest.TestCase):
+    def test_2d_and_3d_periodicity_and_mesh(self) -> None:
+        sheet = parse_poscar(FIXTURES / "project/POSCAR.L1")
+        two_d = resolve_periodicity(sheet, {"dimensionality": "auto"})
+        self.assertEqual(two_d["dimensionality"], 2)
+        self.assertEqual(two_d["periodic_axes"], [True, True, False])
+        mesh = resolve_uniform_mesh(
+            {"spacing_Ainv": 0.5, "maximum": 15},
+            sheet["lattice_angstrom"],
+            two_d["periodic_axes"],
+        )
+        self.assertEqual(mesh[2], 1)
+        self.assertGreater(mesh[0], 1)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            bulk_path = Path(temporary) / "POSCAR"
+            bulk_path.write_text(
+                "bulk\n1.0\n4 0 0\n0 4 0\n0 0 4\nX\n1\nDirect\n0 0 0\n",
+                encoding="utf-8",
+            )
+            bulk = parse_poscar(bulk_path)
+            three_d = resolve_periodicity(bulk, {"dimensionality": "auto"})
+            self.assertEqual(three_d["dimensionality"], 3)
+            self.assertEqual(three_d["periodic_axes"], [True, True, True])
+            self.assertTrue(all(value > 1 for value in resolve_uniform_mesh(
+                {"spacing_Ainv": 0.6}, bulk["lattice_angstrom"], three_d["periodic_axes"]
+            )))
+
+    def test_uniform_grid_patch_and_native_2d_path(self) -> None:
+        incar = 'LWANNIER90 = T\nWANNIER90_WIN = "\nmp_grid = 1 1 1\nbegin projections\nX:p\nend projections\n"\n'
+        patched = patch_wannier_uniform_grid(incar, [2, 2, 1])
+        self.assertIn("mp_grid = 2 2 1", patched)
+        self.assertEqual(patched.count("begin kpoints"), 1)
+        self.assertEqual(patched.count("end kpoints"), 1)
+        try:
+            path = generate_ase_band_path(
+                parse_poscar(FIXTURES / "project/POSCAR.L1"),
+                [True, True, False],
+                20,
+            )
+        except RuntimeError:
+            self.skipTest("ASE optional dependency is not installed")
+        self.assertTrue(path["segments"])
+        self.assertTrue(all(abs(float(value)) < 1e-12 for line in path["wannier_kpoint_path"] for value in [line.split()[-1]]))
+
+    def test_negative_poscar_scale_volume_is_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "POSCAR"
+            path.write_text(
+                "volume form\n-64\n1 0 0\n0 1 0\n0 0 1\nX\n1\nCartesian\n0.5 0.5 0.5\n",
+                encoding="utf-8",
+            )
+            parsed = parse_poscar(path)
+            self.assertAlmostEqual(parsed["lattice_angstrom"][0][0], 4.0)
+            self.assertEqual(parsed["fractional_positions"][0], [0.5, 0.5, 0.5])
 
 
 class WindowTests(unittest.TestCase):
@@ -99,6 +281,24 @@ class WindowTests(unittest.TestCase):
 
 
 class CandidateTests(unittest.TestCase):
+    def test_component_projection_dimension(self) -> None:
+        self.assertEqual(
+            num_wann_from_projection(
+                ["In:s", "In:px", "In:py", "Se:px", "Se:py"],
+                {"In": 2, "Se": 2},
+                True,
+            ),
+            20,
+        )
+        self.assertEqual(
+            normalize_projection(["In:p", "In:px", "In:py", "Se:px"]),
+            ["In:p", "Se:px"],
+        )
+        self.assertEqual(
+            num_wann_from_projection(["In:p", "In:px", "Se:px"], {"In": 2, "Se": 2}, True),
+            16,
+        )
+
     def test_soc_dimension_and_nested_candidates(self) -> None:
         counts = {"Bi": 1, "Te": 1, "I": 1}
         self.assertEqual(num_wann_from_projection(["Bi:p", "Te:p", "I:p"], counts, True), 18)
@@ -124,6 +324,196 @@ class CandidateTests(unittest.TestCase):
         p_only = next(item for item in without_answer if item["candidate"] == "p-only")
         self.assertEqual(p_only["projection"], ["In:p", "Se:p"])
         self.assertEqual(p_only["num_wann"], 24)
+
+    def test_dp_shell_family_is_generated_without_material_rules(self) -> None:
+        candidates = suggest_projection_candidates(
+            {"Pt:d": 0.44, "O:p": 0.41, "Pt:s": 0.08, "O:s": 0.07},
+            {"Pt": 1, "O": 2},
+            True,
+            max_num_wann=40,
+            max_candidates=8,
+        )
+        names = {item["candidate"] for item in candidates}
+        self.assertIn("d-only", names)
+        self.assertIn("p-only", names)
+        self.assertTrue(any(name.startswith("complete-") and "d" in name and "p" in name for name in names))
+
+    def test_external_projection_baseline_is_quality_gated_candidate_not_answer(self) -> None:
+        candidates = suggest_projection_candidates(
+            {"In:s": 0.24, "In:p": 0.24, "In:d": 0.05, "Se:s": 0.03, "Se:p": 0.44},
+            {"In": 2, "Se": 2},
+            True,
+            max_num_wann=40,
+            external_candidates=[{
+                "candidate": "pyw90-dos",
+                "projection": ["In:s", "Se:p"],
+                "candidate_family": "external_baseline",
+            }],
+        )
+        baseline = next(item for item in candidates if item["candidate"] == "pyw90-dos")
+        self.assertEqual(baseline["num_wann"], 16)
+        self.assertEqual(baseline["candidate_family"], "external_baseline")
+
+        components = suggest_projection_candidates(
+            {"In:s": 0.2, "In:p": 0.4, "Se:p": 0.4},
+            {"In": 2, "Se": 2},
+            True,
+            max_num_wann=40,
+            external_candidates=[{
+                "candidate": "pyw90-components",
+                "projection": ["In:s", "In:px", "In:py", "Se:px", "Se:py"],
+            }],
+        )
+        component = next(item for item in components if item["candidate"] == "pyw90-components")
+        self.assertEqual(component["num_wann"], 20)
+        self.assertEqual(component["integrated_weight_estimate"], "equal_component_split")
+        self.assertAlmostEqual(component["integrated_weight_fraction"], 11 / 15)
+
+    def test_iteration_budget_controls_disentanglement_plans(self) -> None:
+        energies = [[-2.0, -1.0, 0.0, 1.0], [-1.9, -0.8, 0.2, 1.2]]
+        features = [{"orbital_scores": {"X:p": 1.0}} for _ in range(4)]
+        candidate = {"projection": ["X:p"], "num_wann": 3}
+        plans = plan_candidate(
+            energies,
+            features,
+            candidate,
+            -1.1,
+            0.3,
+            isolation_threshold_eV=10.0,
+            max_window_attempts=1,
+            max_localization_retries=0,
+        )
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]["mode"], "disentanglement")
+
+        expanded = plan_candidate(
+            energies,
+            features,
+            candidate,
+            -1.1,
+            0.3,
+            isolation_threshold_eV=10.0,
+            max_window_attempts=3,
+            max_localization_retries=2,
+        )
+        self.assertEqual(len(expanded), 5)
+        self.assertEqual(
+            [plan.get("retry_reason", "seed") for plan in expanded],
+            [
+                "seed",
+                "outer_window_expansion_001",
+                "outer_window_expansion_002",
+                "convergence_retry_001",
+                "convergence_retry_002",
+            ],
+        )
+        self.assertEqual(expanded[2]["retry_class"], "outer_window_expansion")
+        self.assertEqual(expanded[4]["retry_class"], "convergence_retry")
+
+    def test_vasp54_standalone_win_preserves_candidate_dimension_and_controls(self) -> None:
+        incar = '''NBANDS = 48
+NUM_WANN = 22
+WANNIER90_WIN = "
+exclude_bands = 1-4,27-64
+begin projections
+Mo:d
+S:p
+end projections
+bands_plot = true
+write_hr = true
+precond = true
+"
+'''
+        text = build_standalone_w90_input(
+            incar,
+            num_wann=22,
+            total_vasp_bands=64,
+            plan={"mode": "exact", "exclude_bands_1_based": [*range(1, 5), *range(27, 65)]},
+        )
+        self.assertIn("num_wann = 22", text)
+        self.assertIn("num_bands = 22", text)
+        self.assertIn("Mo:d", text)
+        self.assertIn("S:p", text)
+        self.assertIn("bands_plot = true", text)
+        self.assertIn("write_hr = true", text)
+        self.assertNotIn("precond", text.lower())
+
+    def test_vasp54_standalone_win_uses_all_bands_for_disentanglement(self) -> None:
+        incar = '''WANNIER90_WIN = "
+begin projections
+Mo:p
+Mo:d
+S:p
+end projections
+dis_win_min = -8
+dis_win_max = 10
+"
+'''
+        text = build_standalone_w90_input(
+            incar,
+            num_wann=28,
+            total_vasp_bands=64,
+            plan={"mode": "disentanglement"},
+        )
+        self.assertIn("num_wann = 28", text)
+        self.assertIn("num_bands = 64", text)
+        self.assertIn("dis_win_min = -8", text)
+
+    def test_vasp54_post_vasp_kpoints_use_signed_equivalent_mesh(self) -> None:
+        original = """mp_grid = 3 3 1
+begin kpoints
+  0.000000000000 0.000000000000 0.000000000000
+  0.000000000000 0.333333333333 0.000000000000
+  0.000000000000 0.666666666667 0.000000000000
+  0.500000000000 0.000000000000 0.000000000000
+end kpoints
+begin kpoint_path
+G 0 0 0 M 0.5 0 0
+end kpoint_path
+"""
+        converted, moved = canonicalize_standalone_w90_kpoints(original)
+        self.assertEqual(moved, 2)
+        self.assertIn("0.000000000000 -0.333333333333 0.000000000000", converted)
+        self.assertIn("-0.500000000000 0.000000000000 0.000000000000", converted)
+        self.assertIn("G 0 0 0 M 0.5 0 0", converted)
+
+    def test_vasp54_mmn_axis_swap_is_applied_only_after_exact_nnkp_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mmn = root / "wannier90.mmn"
+            nnkp = root / "wannier90.nnkp"
+            mmn.write_text(
+                "test\n"
+                "1 2 1\n"
+                "    1    2    1    0    0\n"
+                "  0.500000000000  0.000000000000\n"
+                "    2    1   -1    0    0\n"
+                "  0.500000000000  0.000000000000\n",
+                encoding="utf-8",
+            )
+            nnkp.write_text(
+                "begin nnkpts\n"
+                "1\n"
+                "1 2 0 1 0\n"
+                "2 1 0 -1 0\n"
+                "end nnkpts\n",
+                encoding="utf-8",
+            )
+            result = reconcile_mmn_neighbour_cells(mmn, nnkp)
+            self.assertEqual(result["permutation"], [1, 0, 2])
+            self.assertEqual(result["changed_headers"], 2)
+            lines = mmn.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(tuple(map(int, lines[2].split())), (1, 2, 0, 1, 0))
+            self.assertEqual(tuple(map(int, lines[4].split())), (2, 1, 0, -1, 0))
+
+    def test_candidate_smaller_than_target_manifold_is_rejected_before_vasp(self) -> None:
+        energies = [
+            [-5.0, -3.0, -2.0, -1.0, 0.0, 2.0],
+            [-4.9, -2.9, -1.9, -0.9, 0.1, 2.1],
+        ]
+        features = [{"orbital_scores": {"X:s": 1.0}} for _ in range(6)]
+        candidate = {"projection": ["X:s"], "num_wann": 3}
+        self.assertEqual(plan_candidate(energies, features, candidate, -3.2, 0.2), [])
 
     def test_dataset_failure_label_required(self) -> None:
         record = make_attempt_record(
@@ -196,6 +586,54 @@ class CandidateTests(unittest.TestCase):
 
 
 class RankingTests(unittest.TestCase):
+    def test_independent_ranking_keeps_only_best_attempt_per_projection_candidate(self) -> None:
+        def item(candidate: str, attempt: str, p95: float) -> dict:
+            return {
+                "candidate": candidate,
+                "attempt": attempt,
+                "passed": True,
+                "num_wann": 8,
+                "metrics": {
+                    "mae_mev": 1.0,
+                    "rmse_mev": 2.0,
+                    "p95_mev": p95,
+                    "max_mev": 5.0,
+                },
+            }
+
+        selected = _best_attempt_per_candidate([
+            item("complete-sp", "attempt-001", 5.0),
+            item("complete-sp", "attempt-002", 3.0),
+            item("p-only", "attempt-001", 4.0),
+        ])
+        self.assertEqual(
+            {(entry["candidate"], entry["attempt"]) for entry in selected},
+            {("complete-sp", "attempt-002"), ("p-only", "attempt-001")},
+        )
+
+    def test_declared_target_window_excludes_outside_band_segments_from_fit_error(self) -> None:
+        dft = [
+            [(0.0, -1.0), (1.0, -0.8)],
+            [(0.0, 1.0), (1.0, 5.0)],
+        ]
+        w90 = [
+            [(0.0, -1.001), (1.0, -0.801)],
+            [(0.0, 1.001), (1.0, 6.0)],
+        ]
+        full, _ = band_metrics(dft, w90, 1)
+        target, _ = band_metrics(
+            dft,
+            w90,
+            1,
+            error_energy_window_eV=(-2.0, 2.0),
+        )
+        self.assertGreater(full["rmse_mev"], 400.0)
+        self.assertLess(target["rmse_mev"], 2.0)
+        self.assertEqual(target["compared_point_count"], 3)
+        self.assertEqual(target["excluded_point_count"], 1)
+        self.assertEqual(target["error_energy_window_eV"], [-2.0, 2.0])
+        self.assertAlmostEqual(target["gap_error_mev"], 2.0)
+
     def test_export_independent_top_k_without_potcar(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -228,11 +666,18 @@ class RankingTests(unittest.TestCase):
             rank_dir = root / "06_rank"
             rank_dir.mkdir()
             (rank_dir / "candidate-ranking-v04.json").write_text(json.dumps(ranking), encoding="utf-8")
+            (root / "project.snapshot.yaml").write_text(
+                "physics:\n  soc: true\n  dimensionality: 2\n  axes: [x, y, z]\n",
+                encoding="utf-8",
+            )
             result = export_ranked_attempts(root)
             package = Path(result["packages"][0]["path"])
             self.assertTrue((package / "SnS2/wannier90-wcenter.dat").is_file())
             self.assertFalse(any(path.name == "POTCAR" for path in package.rglob("*")))
             self.assertEqual(result["ensemble_mode"], "independent")
+            manifest = json.loads((package / "package-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["physics"]["dimensionality"], 2)
+            self.assertTrue(manifest["physics"]["soc"])
 
     def test_target_mapping_and_complete_shell_tie_break(self) -> None:
         dft = [[(0.0, -1.0), (1.0, -0.8)], [(0.0, 1.0), (1.0, 1.2)]]
@@ -246,6 +691,33 @@ class RankingTests(unittest.TestCase):
         self.assertLess(metrics["rmse_mev"], 2.0)
         self.assertTrue(_is_complete_sp(["X:s", "X:p", "Y:s", "Y:p"]))
         self.assertFalse(_is_complete_sp(["X:p", "Y:s", "Y:p"]))
+
+    def test_target_window_controls_disentangled_band_mapping(self) -> None:
+        dft = [
+            [(0.0, -1.0), (1.0, -0.8)],
+            [(0.0, 1.0), (1.0, 5.0)],
+        ]
+        w90 = [
+            [(0.0, -1.001), (1.0, -0.801)],
+            [(0.0, 1.001), (1.0, 6.0)],
+            [(0.0, 8.0), (1.0, 8.0)],
+        ]
+        start, metrics = _best_contiguous_w90_slice(
+            dft,
+            w90,
+            1,
+            error_energy_window_eV=(-2.0, 2.0),
+        )
+        self.assertEqual(start, 0)
+        self.assertLess(metrics["rmse_mev"], 2.0)
+
+    def test_postfit_target_subspace_rejection_keeps_auditable_dimensions(self) -> None:
+        dft = [[(0.0, -1.0)], [(0.0, 1.0)]]
+        w90 = [[(0.0, -1.0)]]
+        with self.assertRaises(IncompleteTargetSubspace) as captured:
+            _best_contiguous_w90_slice(dft, w90, 1)
+        self.assertEqual(captured.exception.target_band_count, 2)
+        self.assertEqual(captured.exception.model_dimension, 1)
 
     def test_worst_member_ranking_and_rejection(self) -> None:
         good = {"mae_mev": 1, "rmse_mev": 2, "p95_mev": 3, "max_mev": 5, "gap_error_mev": 1}
@@ -302,6 +774,42 @@ class WorkflowTests(unittest.TestCase):
             statuses = read_status(run)["stages"]
             self.assertEqual(len(statuses), 8)
             self.assertTrue(all(item["status"] == "PENDING" for item in statuses))
+
+    def test_explicit_run_dir_is_unique_and_must_stay_inside_runs_root(self) -> None:
+        config = load_project(CONFIG)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "runs"
+            fixed = root / "deterministic-coldstart"
+            run = initialize_run(config, root, run_dir=fixed)
+            self.assertEqual(run, fixed.resolve())
+            with self.assertRaises(FileExistsError):
+                initialize_run(config, root, run_dir=fixed)
+            with self.assertRaises(ValueError):
+                initialize_run(config, root, run_dir=Path(temporary) / "outside")
+
+    def test_fit_from_bands_dry_run_is_single_entrypoint(self) -> None:
+        config = load_project(CONFIG)
+        result = fit_from_precomputed(
+            config,
+            "unused",
+            {"L1": "/scf/L1", "L2": "/scf/L2"},
+            {"L1": "/band/L1", "L2": "/band/L2"},
+            execute=False,
+        )
+        self.assertEqual(result["mode"], "DRY_RUN")
+        self.assertIn("CHGCAR", result["contract"]["band_required"])
+
+    def test_fit_from_bands_rejects_execute_and_bootstrap_together(self) -> None:
+        config = load_project(CONFIG)
+        with self.assertRaises(ValueError):
+            fit_from_precomputed(
+                config,
+                "unused",
+                {"L1": "/scf/L1", "L2": "/scf/L2"},
+                {"L1": "/band/L1", "L2": "/band/L2"},
+                execute=True,
+                bootstrap_only=True,
+            )
 
     @unittest.skipUnless(HAS_REFERENCE_FIXTURES, "set W90FLOW_REFERENCE_ROOT for prepublication reference fixtures")
     def test_all_reference_examples(self) -> None:
@@ -360,6 +868,21 @@ class WorkflowTests(unittest.TestCase):
         )
         with self.assertRaises(WorkflowBlocked):
             choose_retry_reason(["NUMERIC_FAILURE"], set())
+        self.assertEqual(
+            choose_retry_reason(
+                ["LOCALIZATION_NOT_CONVERGED"],
+                {"seed", "convergence_retry_001"},
+                {"outer_window_expansion", "convergence_retry"},
+            ),
+            "convergence_retry",
+        )
+        self.assertIsNone(
+            choose_retry_reason(
+                ["LOCALIZATION_NOT_CONVERGED"],
+                {"seed", "convergence_retry_001", "convergence_retry_002"},
+                {"outer_window_expansion"},
+            )
+        )
 
     def test_common_attempt_resume_only_runs_missing_members(self) -> None:
         self.assertTrue(group_has_runnable_member({"ACCEPTED", "READY"}))

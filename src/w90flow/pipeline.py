@@ -40,12 +40,15 @@ def plan_project(config: dict[str, Any]) -> dict[str, Any]:
             "poscar": item["poscar_resolved"],
             "vasp_kind": backend.get("vasp", kind),
             "mpi_processes": int(backend.get("mpi_processes", 2)),
+            "structure_analysis": item.get("structure_analysis"),
+            "meshes_resolved": item.get("meshes_resolved", {}),
         })
     return {
         "project": config["project"],
         "mode": "PLAN_ONLY",
         "note": "plan 不会启动 VASP；后续 execute 必须显式开启。",
         "structures": structures,
+        "band_path_provider": config.get("band_path", {}).get("mode", "template"),
         "stages": [{"stage": stage, "input": inputs, "output": outputs} for stage, inputs, outputs in STAGE_CONTRACTS],
         "launcher_template": [launcher, "<stage-directory>", f"{backend.get('vasp', kind)}", str(backend.get("mpi_processes", 2))],
     }
