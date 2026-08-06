@@ -197,7 +197,7 @@ def _save(root: Path, status: str, **extra: Any) -> dict[str, Any]:
 def inspect_supervisor(run_dir: str | Path) -> dict[str, Any]:
     root = Path(run_dir).expanduser().resolve()
     state_path = root / STATE_FILE
-    state = read_json(state_path) if state_path.is_file() else {"status": "NOT_STARTED"}
+    state: dict[str, Any] = read_json(state_path) if state_path.is_file() else {"status": "NOT_STARTED"}
     supervisor_pid = int(state.get("supervisor_pid") or 0)
     child_pid = int((state.get("active_child") or {}).get("pid") or 0)
     return {
@@ -223,8 +223,8 @@ def _signal_checkpoint(callback: Callable[[int], None]) -> Iterator[None]:
     try:
         yield
     finally:
-        for signum, previous in old.items():
-            signal.signal(signum, previous)
+        for restored, previous in old.items():
+            signal.signal(restored, previous)
 
 
 def _command(root: Path, target: str) -> tuple[list[str], dict[str, str], Path]:
@@ -361,7 +361,7 @@ def supervise_workflow(
         return preview
 
     deadline = None if max_hours is None else time.monotonic() + max_hours * 3600.0
-    pause = {"requested": False, "reason": None}
+    pause: dict[str, Any] = {"requested": False, "reason": None}
     live_context: dict[str, Any] = {"target": None, "active_child": None}
 
     def request_pause(signum: int) -> None:

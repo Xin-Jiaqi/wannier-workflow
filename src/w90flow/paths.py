@@ -32,3 +32,9 @@ def matplotlib_cache_dir() -> Path:
     """Matplotlib cache directory, from ``W90FLOW_MPL_CACHE`` or a temp directory."""
     value = os.environ.get("W90FLOW_MPL_CACHE")
     return Path(value).expanduser() if value else Path(tempfile.gettempdir()) / "w90flow-matplotlib"
+
+
+def runs_root() -> Path:
+    """Directory for workflow run state, from ``W90FLOW_RUNS_ROOT`` or a temp directory."""
+    value = os.environ.get("W90FLOW_RUNS_ROOT")
+    return Path(value).expanduser() if value else Path(tempfile.gettempdir()) / "w90flow-runs"

@@ -12,7 +12,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .parsers import count_wannier_centres, parse_hr_header
 
@@ -63,7 +63,7 @@ def _object_sha256(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _resolve(base: Path, value: str, field: str) -> Path:
+def _resolve(base: Path, value: Any, field: str) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise ResponsePlanError(f"{field} must be a non-empty path")
     path = Path(value).expanduser()
@@ -95,8 +95,8 @@ def _validate_grid(config: dict[str, Any], name: str) -> dict[str, Any]:
     energy = config.get("energy_grid_eV")
     if not isinstance(energy, dict):
         raise ResponsePlanError(f"responses.{name}.energy_grid_eV must be an object")
-    minimum = float(energy.get("min"))
-    maximum = float(energy.get("max"))
+    minimum = float(cast(Any, energy.get("min")))
+    maximum = float(cast(Any, energy.get("max")))
     points = _positive_int(energy.get("points"), f"responses.{name}.energy_grid_eV.points")
     if points < 2 or maximum <= minimum:
         raise ResponsePlanError(f"responses.{name}.energy_grid_eV requires max > min and points >= 2")

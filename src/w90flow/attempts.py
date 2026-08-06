@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 from .parsers import parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_procar_orbital_scores, parse_wout
 from .paths import launcher_root
@@ -453,9 +453,9 @@ def reconcile_mmn_neighbour_cells(mmn_path: str | Path, nnkp_path: str | Path) -
     if len(expected) != len(headers) or any(len(header) != 5 for header in expected):
         raise ValueError("NNKP 邻接块长度非法。")
 
-    transforms: list[tuple[tuple[int, int, int], tuple[int, int, int], list[tuple[int, int, int, int, int]]]] = []
+    transforms: list[tuple[tuple[int, ...], tuple[int, ...], list[tuple[int, ...]]]] = []
     expected_counter = Counter(expected)
-    candidates = [((0, 1, 2), (1, 1, 1))]
+    candidates: list[tuple[tuple[int, ...], tuple[int, ...]]] = [((0, 1, 2), (1, 1, 1))]
     candidates.extend(
         (permutation, signs)
         for permutation in itertools.permutations(range(3))

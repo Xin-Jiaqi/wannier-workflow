@@ -2,11 +2,11 @@
 
 Source snapshot copied from:
 
-`/private/tmp/w90flow-stage1-generalization-20260722`
+`<workspace>/tmp/w90flow-stage1-generalization-20260722`
 
 Isolated working tree:
 
-`/private/tmp/w90flow-preprocess-agent-20260722`
+`<workspace>/tmp/w90flow-preprocess-agent-20260722`
 
 ## Preprocess-owned files
 

@@ -106,7 +106,7 @@ def _audit_pair(example: Path) -> dict[str, Any]:
     issues: list[str] = []
     if not ranking_path.is_file():
         issues.append("缺少 projection-ranking.json")
-        ranking = {"passed": False, "issues": ["missing"]}
+        ranking: dict[str, Any] = {"passed": False, "issues": ["missing"]}
     else:
         ranking = audit_ranking_document(_load_json(ranking_path))
         issues.extend(ranking["issues"])

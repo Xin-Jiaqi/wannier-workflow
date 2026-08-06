@@ -76,10 +76,11 @@ def rank_common_candidates(
 
 def audit_ranking_document(document: dict[str, Any]) -> dict[str, Any]:
     joint = document.get("joint_common_basis")
-    is_joint_v04 = isinstance(joint, dict)
-    if is_joint_v04:
+    if isinstance(joint, dict):
+        is_joint_v04 = True
         entries = joint.get("ranking")
     else:
+        is_joint_v04 = False
         entries = document.get("rankings", document.get("ranking"))
     if not isinstance(entries, list) or not entries:
         label = "joint_common_basis/ranking" if is_joint_v04 else "ranking/rankings"
@@ -118,7 +119,7 @@ def audit_ranking_document(document: dict[str, Any]) -> dict[str, Any]:
                 if missing:
                     issues.append(f"{name} 缺少共同结构：{','.join(missing)}")
 
-    if is_joint_v04:
+    if isinstance(joint, dict):
         top_k = joint.get("top_k")
         if not isinstance(top_k, list) or not top_k:
             issues.append("joint_common_basis/top_k 列表缺失")

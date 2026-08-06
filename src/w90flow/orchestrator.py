@@ -8,9 +8,9 @@ import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 from .attempts import create_attempts, recorded_or_classified_failure, run_attempt
 from .executor import generate_candidates, import_completed_stage, prepare_run, reconcile_stage, run_vasp_stage
@@ -150,8 +150,8 @@ def inspect_workflow(run_dir: str | Path) -> dict[str, Any]:
 def fit_from_precomputed(
     config: dict[str, Any],
     runs_root: str | Path,
-    scf_sources: dict[str, str | Path],
-    band_sources: dict[str, str | Path],
+    scf_sources: Mapping[str, str | Path],
+    band_sources: Mapping[str, str | Path],
     *,
     execute: bool = False,
     bootstrap_only: bool = False,
@@ -206,7 +206,7 @@ def fit_from_precomputed(
 def fit_from_preprocess(
     config: dict[str, Any],
     runs_root: str | Path,
-    preprocess_sources: dict[str, str | Path],
+    preprocess_sources: Mapping[str, str | Path],
     *,
     execute: bool = False,
     bootstrap_only: bool = False,

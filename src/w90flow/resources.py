@@ -32,9 +32,12 @@ def _memory_bytes() -> int | None:
 
 
 def _affinity_cpus() -> int | None:
+    getaffinity = getattr(os, "sched_getaffinity", None)
+    if getaffinity is None:
+        return None
     try:
-        return len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
+        return len(getaffinity(0))
+    except OSError:
         return None
 
 

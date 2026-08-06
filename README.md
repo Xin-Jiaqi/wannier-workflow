@@ -58,7 +58,7 @@ PYTHONPATH=src python3 -m w90flow stage1-coldstart /path/to/stage1.yaml \
 # 复核 dry-run 后才执行；重复这条命令就是断点续跑
 PYTHONPATH=src python3 -m w90flow stage1-coldstart /path/to/stage1.yaml \
   --campaign-dir /path/to/campaign-state \
-  --runs-root /private/tmp/LocalVASP-mount/runs/w90flow \
+  --runs-root /path/to/runs \
   --execute
 ```
 

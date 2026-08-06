@@ -7,6 +7,7 @@ from typing import Any
 
 from .config import ConfigError, load_project
 from .coldstart import run_stage1_coldstart
+from .paths import runs_root
 from .attempts import create_attempts, import_completed_attempt, run_attempt
 from .candidates import suggest_projection_candidates
 from .executor import finalize_run, generate_candidates, import_completed_stage, prepare_run, reconcile_stage, run_vasp_stage
@@ -53,7 +54,7 @@ def _source_mappings(values: list[str]) -> dict[str, str]:
 
 def _preprocess_project(config_path: str, poscar_path: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """Load one portable YAML file and resolve its file inputs against that file."""
-    import yaml
+    import yaml  # type: ignore[import-untyped]
 
     config_file = Path(config_path).expanduser().resolve()
     with config_file.open("r", encoding="utf-8") as handle:
@@ -157,7 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     coldstart.add_argument("config")
     coldstart.add_argument("--campaign-dir", required=True)
-    coldstart.add_argument("--runs-root", default="/private/tmp/LocalVASP-mount/runs/w90flow")
+    coldstart.add_argument("--runs-root", default=None)
     coldstart.add_argument("--poll-seconds", type=float, default=30.0)
     coldstart.add_argument("--execute", action="store_true")
 
@@ -387,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
             result = run_stage1_coldstart(
                 args.config,
                 args.campaign_dir,
-                args.runs_root,
+                args.runs_root or runs_root(),
                 execute=args.execute,
                 poll_seconds=args.poll_seconds,
             )

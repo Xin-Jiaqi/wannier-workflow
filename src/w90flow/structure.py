@@ -213,13 +213,12 @@ def generate_ase_band_path(
     for left, right in pairs:
         start = [float(value) for value in path.special_points[left]]
         stop = [float(value) for value in path.special_points[right]]
-        lines.append("{:.12f} {:.12f} {:.12f} ! {}".format(*start, left))
-        lines.append("{:.12f} {:.12f} {:.12f} ! {}".format(*stop, right))
+        lines.append(f"{start[0]:.12f} {start[1]:.12f} {start[2]:.12f} ! {left}")
+        lines.append(f"{stop[0]:.12f} {stop[1]:.12f} {stop[2]:.12f} ! {right}")
         lines.append("")
         w90_lines.append(
-            "{} {:.12f} {:.12f} {:.12f} {} {:.12f} {:.12f} {:.12f}".format(
-                left, *start, right, *stop
-            )
+            f"{left} {start[0]:.12f} {start[1]:.12f} {start[2]:.12f} "
+            f"{right} {stop[0]:.12f} {stop[1]:.12f} {stop[2]:.12f}"
         )
     return {
         "provider": "ase_cell_bandpath",

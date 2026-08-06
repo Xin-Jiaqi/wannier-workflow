@@ -7,7 +7,7 @@ import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .parsers import count_wannier_centres, parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_wout
 from .paths import matplotlib_cache_dir
@@ -249,7 +249,7 @@ def _plot_comparison(
 
 
 def evaluate_run(run_dir: str | Path) -> dict[str, Any]:
-    import yaml
+    import yaml  # type: ignore[import-untyped]
 
     root = Path(run_dir).expanduser().resolve()
     with (root / "project.snapshot.yaml").open("r", encoding="utf-8") as handle:
@@ -396,7 +396,10 @@ def evaluate_attempt(
     dft_all = dft_band_blocks(eig, poscar["lattice_angstrom"])
     w90_all = read_w90_band_blocks(directory / "wannier90_band.dat")
     fermi = parse_fermi_outcar(base / "01_scf/OUTCAR")
-    target_window_declared = tuple(float(value) for value in config["physics"]["target_energy_eV"])
+    target_window_declared = cast(
+        tuple[float, float],
+        tuple(float(value) for value in config["physics"]["target_energy_eV"]),
+    )
     energy_reference = str(config["physics"].get("energy_reference", "absolute"))
     if energy_reference == "fermi_relative":
         target_window_absolute = (
@@ -773,14 +776,14 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
     if spec["ensemble_mode"] == "common_basis":
         structure_ids = [str(item["id"]) for item in config["structures"]]
         joint = _common_attempt_ranking(results_by_structure, structure_ids)
-        best = joint["ranking"][0] if joint["ranking"] else None
-        practical = [] if best is None else [
+        joint_best = joint["ranking"][0] if joint["ranking"] else None
+        practical = [] if joint_best is None else [
             item for item in joint["ranking"]
             if item["complete_shell_candidate"]
-            and item["pair_worst_metrics"]["p95_mev"] <= best["pair_worst_metrics"]["p95_mev"] + 2.0
-            and item["pair_worst_metrics"]["max_mev"] <= best["pair_worst_metrics"]["max_mev"] + 10.0
+            and item["pair_worst_metrics"]["p95_mev"] <= joint_best["pair_worst_metrics"]["p95_mev"] + 2.0
+            and item["pair_worst_metrics"]["max_mev"] <= joint_best["pair_worst_metrics"]["max_mev"] + 10.0
         ]
-        selected = None if best is None else (
+        joint_selected = None if joint_best is None else (
             min(
                 practical,
                 key=lambda item: (
@@ -788,15 +791,15 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
                     item["num_wann"],
                     item["rank"],
                 ),
-            ) if practical else best
+            ) if practical else joint_best
         )
-        joint["optical_basis_recommendation"] = None if selected is None else {
-            "candidate": selected["candidate"],
-            "attempt": selected["attempt"],
-            "fit_rank": selected["rank"],
+        joint["optical_basis_recommendation"] = None if joint_selected is None else {
+            "candidate": joint_selected["candidate"],
+            "attempt": joint_selected["attempt"],
+            "fit_rank": joint_selected["rank"],
             "reason": (
                 "complete_observed_shell_family_within_practical_pair_worst_fit_tolerance"
-                if selected["complete_shell_candidate"] else
+                if joint_selected["complete_shell_candidate"] else
                 "no_complete_shell_family_within_practical_pair_worst_fit_tolerance_use_best_fit_provisionally"
             ),
             "requires_observable_convergence_check": True,

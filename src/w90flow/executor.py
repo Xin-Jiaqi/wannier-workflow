@@ -8,13 +8,13 @@ import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 from .candidates import num_wann_from_projection, suggest_projection_candidates
 from .parsers import parse_eigenval, parse_fermi_outcar, parse_outcar_status, parse_poscar, parse_procar_orbital_scores, parse_wout
-from .paths import launcher_root
+from .paths import launcher_root, pyw90_executable as pyw90_executable_env
 from .pyw90_adapter import element_projection_envelope, run_dos_suggest
 from .state import atomic_json, initialize_run, read_json, sha256_file, update_stage
 from .structure import (
@@ -416,7 +416,7 @@ def reconcile_stage(run_dir: str | Path, stage: str, structure_ids: list[str] | 
 def import_completed_stage(
     run_dir: str | Path,
     stage: str,
-    sources: dict[str, str | Path],
+    sources: Mapping[str, str | Path],
 ) -> dict[str, Any]:
     """Import a completed, input-identical SCF/Band stage without recomputation.
 
@@ -515,7 +515,7 @@ def generate_candidates(run_dir: str | Path) -> dict[str, Any]:
     if pyw90_required and not pyw90_enabled:
         raise ValueError("candidates.pyw90_dos.required=true 时 enabled 也必须为 true。")
     pyw90_lower_bound = float(pyw90_config.get("lower_bound", 0.1))
-    pyw90_executable = str(pyw90_config.get("executable", "/private/tmp/LocalVASP-mount/bin/pyw90"))
+    pyw90_executable = str(pyw90_config.get("executable") or pyw90_executable_env() or "")
     analyses: dict[str, Any] = {}
     element_counts_by_structure: dict[str, dict[str, int]] = {}
     for item in config["structures"]:

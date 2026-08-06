@@ -313,14 +313,16 @@ def run_dos_suggest(
     degeneracy: int,
     lower_bound: float = 0.1,
     energy_reference: str = "fermi_relative",
-    executable: str | Path = "/private/tmp/LocalVASP-mount/bin/pyw90",
+    executable: str | Path | None = None,
     output_json: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run PyW90 DOS projection analysis in an isolated scratch directory."""
     source = Path(vasprun_xml).expanduser().resolve()
-    tool = Path(executable).expanduser().resolve()
+    tool = Path(executable or pyw90_executable() or "").expanduser().resolve()
     if not source.is_file() or source.name != "vasprun.xml":
         raise ValueError("vasprun_xml 必须指向名为 vasprun.xml 的文件。")
+    if not executable and not pyw90_executable():
+        raise ValueError("未提供 PyW90 可执行文件：请通过 --executable 或 W90FLOW_PYW90_EXECUTABLE 环境变量指定。")
     if not tool.is_file():
         raise ValueError(f"找不到 PyW90 可执行文件：{tool}")
     low, high = map(float, target_energy_eV)
