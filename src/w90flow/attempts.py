@@ -13,6 +13,7 @@ from typing import Any
 import yaml
 
 from .parsers import parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_procar_orbital_scores, parse_wout
+from .paths import launcher_root
 from .state import atomic_json, read_json, sha256_file
 from .windows import minimum_outer_max, validate_frozen_window, validate_outer_window, validate_window_containment
 
@@ -587,7 +588,7 @@ def recorded_or_classified_failure(record: dict[str, Any], directory: Path) -> s
 
 
 def _commands(config: dict[str, Any], directory: Path) -> list[list[str]]:
-    workspace = Path(__file__).resolve().parents[4]
+    workspace = launcher_root()
     backend = config.get("backend", {})
     default_kind = "ncl" if config.get("physics", {}).get("soc") else "std"
     return [

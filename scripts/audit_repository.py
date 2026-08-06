@@ -18,7 +18,7 @@ FORBIDDEN_NAMES = {
 }
 FORBIDDEN_SUFFIXES = {".amn", ".mmn", ".unk"}
 TEXT_SUFFIXES = {".md", ".py", ".toml", ".yaml", ".yml", ".json", ".txt"}
-PERSONAL_PATH = re.compile(r"/(?:Users|Volumes)/[A-Za-z0-9_. -]+/")
+PERSONAL_PATH = re.compile(r"/(?:Users|Volumes|private|tmp)/[A-Za-z0-9_. -]+/")
 MAX_TRACKABLE_BYTES = 5 * 1024 * 1024
 
 

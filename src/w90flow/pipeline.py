@@ -12,6 +12,7 @@ from .parsers import (
     parse_poscar,
     parse_wout,
 )
+from .paths import launcher_root
 from .ranking import audit_ranking_document
 
 
@@ -30,7 +31,7 @@ STAGE_CONTRACTS = [
 def plan_project(config: dict[str, Any]) -> dict[str, Any]:
     backend = config.get("backend", {})
     kind = "ncl" if config.get("physics", {}).get("soc") else "std"
-    workspace_root = Path(__file__).resolve().parents[4]
+    workspace_root = launcher_root()
     launcher = str((workspace_root / "00_命令入口/计算/运行VASP.command").resolve())
     structures = []
     for item in config["structures"]:

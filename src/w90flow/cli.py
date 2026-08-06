@@ -93,7 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     pyw90.add_argument("--target-max", type=float, required=True)
     pyw90.add_argument("--fermi", type=float, required=True)
     pyw90.add_argument("--energy-reference", choices=("absolute", "fermi_relative"), default="fermi_relative")
-    pyw90.add_argument("--executable", default="/private/tmp/LocalVASP-mount/bin/pyw90")
+    pyw90.add_argument("--executable", default=None, help="PyW90 可执行文件；默认取 W90FLOW_PYW90_EXECUTABLE 环境变量")
     pyw90.add_argument("--output")
 
     run_stage = sub.add_parser("run-stage", help="默认 dry-run；加 --execute 才实际运行 VASP/Wannier90")

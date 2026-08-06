@@ -14,6 +14,7 @@ import yaml
 
 from .candidates import suggest_projection_candidates
 from .parsers import parse_eigenval, parse_fermi_outcar, parse_outcar_status, parse_poscar, parse_procar_orbital_scores, parse_wout
+from .paths import launcher_root
 from .state import atomic_json, initialize_run, read_json, sha256_file, update_stage
 
 
@@ -153,7 +154,7 @@ def prepare_run(config: dict[str, Any], runs_root: str | Path) -> Path:
 
 
 def _launcher(run_dir: Path, config: dict[str, Any], directory: Path) -> list[str]:
-    workspace = Path(__file__).resolve().parents[4]
+    workspace = launcher_root()
     executable = workspace / "00_命令入口/计算/运行VASP.command"
     backend = config.get("backend", {})
     default_kind = "ncl" if config.get("physics", {}).get("soc") else "std"
@@ -161,7 +162,7 @@ def _launcher(run_dir: Path, config: dict[str, Any], directory: Path) -> list[st
 
 
 def _wannier_launcher(directory: Path) -> list[str]:
-    workspace = Path(__file__).resolve().parents[4]
+    workspace = launcher_root()
     executable = workspace / "00_命令入口/计算/运行Wannier90.command"
     return [str(executable), str(directory), "wannier90", "run"]
 

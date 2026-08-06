@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .paths import pyw90_executable
 from .state import atomic_json, sha256_file
 
 
@@ -87,14 +88,16 @@ def run_eig_suggest(
     target_energy_eV: tuple[float, float],
     fermi_eV: float,
     energy_reference: str = "fermi_relative",
-    executable: str | Path = "/private/tmp/LocalVASP-mount/bin/pyw90",
+    executable: str | Path | None = None,
     output_json: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run PyW90 as an optional, auditable baseline without changing decisions."""
     source = Path(eigenval).expanduser().resolve()
-    tool = Path(executable).expanduser().resolve()
+    tool = Path(executable or pyw90_executable() or "").expanduser().resolve()
     if not source.is_file():
         raise ValueError(f"找不到 EIGENVAL：{source}")
+    if not executable and not pyw90_executable():
+        raise ValueError("未提供 PyW90 可执行文件：请通过 --executable 或 W90FLOW_PYW90_EXECUTABLE 环境变量指定。")
     if not tool.is_file():
         raise ValueError(f"找不到 PyW90 可执行文件：{tool}")
     if num_wann <= 0:

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .parsers import count_wannier_centres, parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_wout
+from .paths import matplotlib_cache_dir
 from .state import atomic_json, read_json, sha256_file, update_stage
 
 
@@ -186,9 +187,7 @@ def _plot_comparison(
     title: str,
     metrics: dict[str, float],
 ) -> None:
-    cache = Path("/private/tmp/LocalVASP-mount/cache/w90flow-matplotlib")
-    if not cache.parent.is_dir():
-        cache = output.parents[4] / "cache/w90flow-matplotlib"
+    cache = matplotlib_cache_dir()
     cache.mkdir(exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", str(cache))
     import matplotlib
