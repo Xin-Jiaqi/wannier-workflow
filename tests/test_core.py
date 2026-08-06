@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from w90flow.config import load_project
-from w90flow.attempts import classify_failure, import_completed_attempt, materialize_plan_energy_reference, plan_candidate, recorded_or_classified_failure
+from w90flow.attempts import build_standalone_w90_input, canonicalize_standalone_w90_kpoints, classify_failure, import_completed_attempt, materialize_plan_energy_reference, plan_candidate, reconcile_mmn_neighbour_cells, recorded_or_classified_failure
 from w90flow.candidates import normalize_projection, num_wann_from_projection, suggest_projection_candidates
 from w90flow.dataset import make_attempt_record
 from w90flow.executor import _build_potcar
@@ -26,6 +26,7 @@ from w90flow.state import initialize_run, read_status, update_stage
 from w90flow.supervisor import ProgressWatch, SupervisorLock, inspect_supervisor, progress_fingerprint, supervise_workflow
 from w90flow.structure import generate_ase_band_path, patch_wannier_uniform_grid, resolve_periodicity, resolve_uniform_mesh
 from w90flow.windows import minimum_outer_max, validate_frozen_window, validate_outer_window, validate_window_containment
+from w90flow.resources import candidate_search_plan, detect_resources
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -34,6 +35,40 @@ REFERENCE_ROOT_VALUE = os.environ.get("W90FLOW_REFERENCE_ROOT")
 EXAMPLES = Path(REFERENCE_ROOT_VALUE).expanduser().resolve() if REFERENCE_ROOT_VALUE else None
 HAS_REFERENCE_FIXTURES = EXAMPLES is not None and EXAMPLES.is_dir()
 CONFIG = FIXTURES / "project/pair-example.yaml"
+
+
+class ResourcePlanTests(unittest.TestCase):
+    def test_scheduler_allocation_and_parallel_split(self) -> None:
+        detected = detect_resources({
+            "SLURM_JOB_ID": "123",
+            "SLURM_CPUS_ON_NODE": "32",
+            "SLURM_CPUS_PER_TASK": "32",
+            "SLURM_MEM_PER_NODE": "128000",
+        })
+        self.assertEqual(detected["available_cpus"], 32)
+        plan = candidate_search_plan(
+            available=detected,
+            candidate_count=7,
+            mpi_processes_per_candidate=8,
+            policy="candidate_parallel",
+        )
+        self.assertEqual(plan["workers"], 4)
+        self.assertEqual(plan["allocated_cpus_used"], 32)
+
+    def test_low_memory_machine_stays_single_worker(self) -> None:
+        available = {
+            "available_cpus": 8,
+            "memory_gib": 8.0,
+            "scheduler_allocation": False,
+            "sources": {},
+        }
+        plan = candidate_search_plan(
+            available=available,
+            candidate_count=4,
+            mpi_processes_per_candidate=4,
+            policy="candidate_parallel",
+        )
+        self.assertEqual(plan["workers"], 1)
 
 
 class ParserTests(unittest.TestCase):
@@ -374,6 +409,102 @@ class CandidateTests(unittest.TestCase):
         )
         self.assertEqual(expanded[2]["retry_class"], "outer_window_expansion")
         self.assertEqual(expanded[4]["retry_class"], "convergence_retry")
+
+    def test_vasp54_standalone_win_preserves_candidate_dimension_and_controls(self) -> None:
+        incar = '''NBANDS = 48
+NUM_WANN = 22
+WANNIER90_WIN = "
+exclude_bands = 1-4,27-64
+begin projections
+Mo:d
+S:p
+end projections
+bands_plot = true
+write_hr = true
+precond = true
+"
+'''
+        text = build_standalone_w90_input(
+            incar,
+            num_wann=22,
+            total_vasp_bands=64,
+            plan={"mode": "exact", "exclude_bands_1_based": [*range(1, 5), *range(27, 65)]},
+        )
+        self.assertIn("num_wann = 22", text)
+        self.assertIn("num_bands = 22", text)
+        self.assertIn("Mo:d", text)
+        self.assertIn("S:p", text)
+        self.assertIn("bands_plot = true", text)
+        self.assertIn("write_hr = true", text)
+        self.assertNotIn("precond", text.lower())
+
+    def test_vasp54_standalone_win_uses_all_bands_for_disentanglement(self) -> None:
+        incar = '''WANNIER90_WIN = "
+begin projections
+Mo:p
+Mo:d
+S:p
+end projections
+dis_win_min = -8
+dis_win_max = 10
+"
+'''
+        text = build_standalone_w90_input(
+            incar,
+            num_wann=28,
+            total_vasp_bands=64,
+            plan={"mode": "disentanglement"},
+        )
+        self.assertIn("num_wann = 28", text)
+        self.assertIn("num_bands = 64", text)
+        self.assertIn("dis_win_min = -8", text)
+
+    def test_vasp54_post_vasp_kpoints_use_signed_equivalent_mesh(self) -> None:
+        original = """mp_grid = 3 3 1
+begin kpoints
+  0.000000000000 0.000000000000 0.000000000000
+  0.000000000000 0.333333333333 0.000000000000
+  0.000000000000 0.666666666667 0.000000000000
+  0.500000000000 0.000000000000 0.000000000000
+end kpoints
+begin kpoint_path
+G 0 0 0 M 0.5 0 0
+end kpoint_path
+"""
+        converted, moved = canonicalize_standalone_w90_kpoints(original)
+        self.assertEqual(moved, 2)
+        self.assertIn("0.000000000000 -0.333333333333 0.000000000000", converted)
+        self.assertIn("-0.500000000000 0.000000000000 0.000000000000", converted)
+        self.assertIn("G 0 0 0 M 0.5 0 0", converted)
+
+    def test_vasp54_mmn_axis_swap_is_applied_only_after_exact_nnkp_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mmn = root / "wannier90.mmn"
+            nnkp = root / "wannier90.nnkp"
+            mmn.write_text(
+                "test\n"
+                "1 2 1\n"
+                "    1    2    1    0    0\n"
+                "  0.500000000000  0.000000000000\n"
+                "    2    1   -1    0    0\n"
+                "  0.500000000000  0.000000000000\n",
+                encoding="utf-8",
+            )
+            nnkp.write_text(
+                "begin nnkpts\n"
+                "1\n"
+                "1 2 0 1 0\n"
+                "2 1 0 -1 0\n"
+                "end nnkpts\n",
+                encoding="utf-8",
+            )
+            result = reconcile_mmn_neighbour_cells(mmn, nnkp)
+            self.assertEqual(result["permutation"], [1, 0, 2])
+            self.assertEqual(result["changed_headers"], 2)
+            lines = mmn.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(tuple(map(int, lines[2].split())), (1, 2, 0, 1, 0))
+            self.assertEqual(tuple(map(int, lines[4].split())), (2, 1, 0, -1, 0))
 
     def test_candidate_smaller_than_target_manifold_is_rejected_before_vasp(self) -> None:
         energies = [

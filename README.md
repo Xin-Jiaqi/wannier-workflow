@@ -129,6 +129,40 @@ PYTHONPATH=src python3 -m w90flow.response_plan run RESPONSE_PLAN_DIR
 
 Wannier 拟合与非线性光学求和器保持为两个独立程序。核心交付的最小文件接口见 [NLO_HANDOFF.md](NLO_HANDOFF.md)；当前 Python shift-current/SHG 以后只需按该接口读取 top-K 包，不属于 W90Flow v1.0 的通过条件。
 
+### 候选搜索：最终排名只有一种
+
+每个项目都应使用**完整搜索**作为最终结果：PyW90/PROCAR 只决定候选先后，所有
+预先声明的有限投影与能窗仍会完成，再按真实拟合质量导出 Top-K。所谓“优先搜索”
+只是在完整搜索过程中先运行高优先级候选，使长作业较早产生临时 Top-K；它绝不改变
+候选集合、质量门槛或最终排名。
+
+SCF/Band 固定为单个重 VASP 阶段。它们完成后，不同 Wannier 候选目录彼此独立，可
+按机器资源并行。先在目标队列做一次 `1×32`、`2×16`、`4×8` 的基准，再明确启用
+并行；不要在 8 GiB 本地 Mac 上同时运行多个 VASP。
+
+先查看环境，不启动计算：
+
+```bash
+w90flow resource-plan --candidates 7 --mpi-per-candidate 8 \
+  --policy candidate_parallel
+```
+
+YAML 默认保持串行。通过队列基准后，才加入：
+
+```yaml
+execution:
+  candidate_search:
+    policy: candidate_parallel
+    mpi_processes_per_candidate: 8
+    max_workers: auto
+```
+
+`auto` 读取 Slurm 分配、CPU 亲和性和内存；32 核且内存充足时会得到 `4×8`，8 GiB
+本地机器自动限制为一个 worker。并行只改变候选的运行顺序和资源分配，不改变 SOC、
+投影、能窗或质量门槛。SCF/Band 以及输入哈希一致的 completed stage 仍按原有严格
+规则复用；不同投影的 Wannier 输出只有 `POSCAR+POTCAR+INCAR+KPOINTS+CHGCAR`
+全部一致才可复用。
+
 下面的分步命令仍保留，用于调试和审计：
 
 ```bash

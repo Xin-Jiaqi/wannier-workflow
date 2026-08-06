@@ -32,6 +32,7 @@ from .preprocess import (
 from .structure import resolve_periodicity
 from .supervisor import inspect_supervisor, supervise_workflow
 from .windows import suggest_windows
+from .resources import candidate_search_plan, detect_resources
 
 
 def _emit(payload: Any) -> None:
@@ -192,6 +193,12 @@ def build_parser() -> argparse.ArgumentParser:
     candidates = sub.add_parser("candidate-suggest", help="由目标能区积分轨道权重产生有限嵌套候选")
     candidates.add_argument("scores_json", help="含 orbital_scores、element_counts、chemical_valence 的 JSON")
     candidates.add_argument("--soc", action="store_true")
+
+    resources = sub.add_parser("resource-plan", help="探测本机/Slurm 核数和候选并行方案；不启动计算")
+    resources.add_argument("--candidates", type=int, required=True)
+    resources.add_argument("--mpi-per-candidate", type=int, required=True)
+    resources.add_argument("--policy", choices=("serial", "candidate_parallel"), default="serial")
+    resources.add_argument("--max-workers", default="auto")
 
     pyw90 = sub.add_parser("pyw90-baseline", help="将 PyW90 eig suggest 转为可审计 JSON 对照")
     pyw90.add_argument("eigenval")
@@ -408,6 +415,17 @@ def main(argv: list[str] | None = None) -> int:
                 args.soc,
                 scores.get("chemical_valence"),
             )})
+        elif args.command == "resource-plan":
+            raw_workers: int | str = args.max_workers
+            if raw_workers != "auto":
+                raw_workers = int(raw_workers)
+            _emit(candidate_search_plan(
+                available=detect_resources(),
+                candidate_count=args.candidates,
+                mpi_processes_per_candidate=args.mpi_per_candidate,
+                policy=args.policy,
+                max_workers=raw_workers,
+            ))
         elif args.command == "pyw90-baseline":
             _emit(run_eig_suggest(
                 args.eigenval,

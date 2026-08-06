@@ -226,7 +226,7 @@ def _plot_comparison(
     cache = Path("/private/tmp/LocalVASP-mount/cache/w90flow-matplotlib")
     if not cache.parent.is_dir():
         cache = output.parents[4] / "cache/w90flow-matplotlib"
-    cache.mkdir(exist_ok=True)
+    cache.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", str(cache))
     import matplotlib
     matplotlib.use("Agg")

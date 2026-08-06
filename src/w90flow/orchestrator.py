@@ -5,6 +5,7 @@ import os
 import shutil
 import socket
 import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from .parsers import parse_poscar, parse_wout
 from .structure import resolve_periodicity, resolve_uniform_mesh
 from .quality import IncompleteTargetSubspace, evaluate_attempt, export_ranked_attempts, rank_attempts
 from .state import atomic_json, read_json, read_status, sha256_file, update_stage
+from .resources import candidate_search_plan, detect_resources
 
 
 WORKFLOW_STOPS = ("scf", "band", "candidates", "wannier", "quality", "rank", "export")
@@ -439,6 +441,8 @@ def _process_candidate(
     root: Path,
     structures: list[str],
     candidate: str,
+    *,
+    mpi_processes: int | None = None,
 ) -> dict[str, Any]:
     attempted_reasons: set[str] = set()
     previous_failures: list[str | None] = []
@@ -522,7 +526,7 @@ def _process_candidate(
                 and recorded_or_classified_failure(record, directory) == "INFRASTRUCTURE_FAILURE"
                 and not list(record.get("execution_history", []))
             ):
-                result = run_attempt(root, sid, candidate, selected, execute=True)
+                result = run_attempt(root, sid, candidate, selected, execute=True, mpi_processes=mpi_processes)
                 if not result.get("passed") and result["attempt"].get("failure_class") == "NUMERIC_FAILURE":
                     raise WorkflowBlocked(f"{sid}/{candidate}/{selected} 数值失败。")
 
@@ -558,6 +562,39 @@ def _accepted_coverage(root: Path, config: dict[str, Any], spec: dict[str, Any])
         common = set()
         passed = all(accepted[sid] for sid in structures)
     return {"passed": passed, "accepted": accepted, "common": sorted(common)}
+
+
+def _run_candidate_search(
+    root: Path,
+    config: dict[str, Any],
+    spec: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Run independent candidate directories serially or with bounded workers."""
+    layout = _candidate_layout(config, spec)
+    settings = config.get("execution", {}).get("candidate_search", {})
+    plan = candidate_search_plan(
+        available=detect_resources(),
+        candidate_count=len(layout),
+        mpi_processes_per_candidate=int(settings.get("mpi_processes_per_candidate", config["backend"]["mpi_processes"])),
+        policy=str(settings.get("policy", "serial")),
+        max_workers=settings.get("max_workers", "auto"),
+    )
+    mpi = int(plan["mpi_processes_per_candidate"])
+    if int(plan["workers"]) == 1:
+        return ([{"structures": structures, **_process_candidate(root, structures, candidate, mpi_processes=mpi)}
+                 for structures, candidate in layout], plan)
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=int(plan["workers"]), thread_name_prefix="w90-candidate") as pool:
+        futures = {
+            pool.submit(_process_candidate, root, structures, candidate, mpi_processes=mpi): (structures, candidate)
+            for structures, candidate in layout
+        }
+        for future in as_completed(futures):
+            structures, candidate = futures[future]
+            results.append({"structures": structures, **future.result()})
+    order = {(tuple(structures), candidate): index for index, (structures, candidate) in enumerate(layout)}
+    results.sort(key=lambda item: order[(tuple(item["structures"]), str(item["candidate"]))])
+    return results, plan
 
 
 def _ensure_vasp_stage(root: Path, stage: str, events: list[dict[str, Any]]) -> None:
@@ -639,17 +676,14 @@ def run_workflow(run_dir: str | Path, *, execute: bool = False, until: str = "ex
                 create_attempts(root)
                 events.append({"stage": "wannier", "action": "planned_attempts"})
             spec = read_json(root / "03_candidates/candidate-spec.json")
-            candidate_results = []
-            for structures, candidate in _candidate_layout(config, spec):
-                result = _process_candidate(root, structures, candidate)
-                candidate_results.append({"structures": structures, **result})
+            candidate_results, resource_plan = _run_candidate_search(root, config, spec)
             coverage = _accepted_coverage(root, config, spec)
             if not coverage["passed"]:
                 update_stage(root, "04_wannier", status="FAIL", finished_utc=_utc_now(), outputs=candidate_results)
                 raise WorkflowBlocked("有限候选/能窗尝试结束后仍没有覆盖全部结构的合格 Wannier 表示。")
             update_stage(root, "04_wannier", status="PASS", finished_utc=_utc_now(), outputs=candidate_results)
             update_stage(root, "05_quality", status="PASS", finished_utc=_utc_now(), outputs=[coverage])
-            events.append({"stage": "wannier", "action": "finite_search_complete", "coverage": coverage})
+            events.append({"stage": "wannier", "action": "finite_search_complete", "coverage": coverage, "resource_plan": resource_plan})
             if until in {"wannier", "quality"}:
                 raise StopIteration
 
