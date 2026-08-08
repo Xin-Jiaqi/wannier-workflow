@@ -21,3 +21,12 @@ jobs:
       - run: python -m unittest discover -s tests -p 'test_*.py' -v
       - run: python -m mypy
       - run: python scripts/audit_repository.py
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
