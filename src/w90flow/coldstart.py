@@ -547,6 +547,64 @@ def _verify_preprocess_reuse_source(
     }
 
 
+def _as_bool(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"expected bool, got {type(value).__name__}")
+    return value
+
+
+_CANDIDATE_POLICY_METADATA_KEYS = frozenset({"role", "description", "comment", "note", "reason"})
+_CANDIDATE_POLICY_SCHEMA: dict[str, Any] = {
+    "max_candidates": int,
+    "max_num_wann_fraction_of_bands": float,
+    "shell_family_min_weight": float,
+    "shell_combination_min_weight": float,
+    "chemical_valence_used": _as_bool,
+    "pyw90_dos": {
+        "enabled": _as_bool,
+        "required": _as_bool,
+        "lower_bound": float,
+    },
+}
+
+
+def _canonicalize_candidate_policy(
+    policy: dict[str, Any],
+    *,
+    source: str,
+    schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Canonicalize a candidate policy to the scientific fields that matter.
+
+    Only keys in the explicit science schema are compared.  Known metadata
+    keys (role/description/comment/note/reason) are dropped.  Any other
+    unknown key is treated conservatively as possibly scientific and rejects
+    reuse, unless it can be proven to be metadata by name.
+    """
+    schema = _CANDIDATE_POLICY_SCHEMA if schema is None else schema
+    if not isinstance(policy, dict):
+        raise ValueError(f"候选策略无效（{source}），拒绝复用 candidates")
+    canonical: dict[str, Any] = {}
+    for key, converter in schema.items():
+        if key not in policy:
+            raise ValueError(f"候选策略缺少科学字段 {key}（{source}），拒绝复用 candidates")
+        if isinstance(converter, dict):
+            canonical[key] = _canonicalize_candidate_policy(
+                policy[key], source=f"{source}.{key}", schema=converter
+            )
+        else:
+            try:
+                canonical[key] = converter(policy[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"候选策略字段 {key} 无法转换（{source}）：{policy[key]!r}") from exc
+    for key in policy:
+        if key not in schema and key not in _CANDIDATE_POLICY_METADATA_KEYS:
+            raise ValueError(
+                f"候选策略含未知字段 {key}（{source}），无法证明是 metadata，拒绝复用 candidates"
+            )
+    return canonical
+
+
 def _verify_candidates_reuse_source(
     wannier_prior: str | Path,
     config: dict[str, Any],
@@ -572,10 +630,10 @@ def _verify_candidates_reuse_source(
         "max_num_wann_fraction_of_bands": float(candidates.get("max_num_wann_fraction_of_bands", 1.0)),
         "shell_family_min_weight": float(candidates.get("shell_family_min_weight", 0.08)),
         "shell_combination_min_weight": float(candidates.get("shell_combination_min_weight", 0.45)),
-        "chemical_valence_used": bool(candidates.get("chemical_valence")),
+        "chemical_valence_used": _as_bool(bool(candidates.get("chemical_valence"))),
         "pyw90_dos": {
-            "enabled": bool(pyw90.get("enabled", False)),
-            "required": bool(pyw90.get("required", False)),
+            "enabled": _as_bool(bool(pyw90.get("enabled", False))),
+            "required": _as_bool(bool(pyw90.get("required", False))),
             "lower_bound": float(pyw90.get("lower_bound", 0.1)),
         },
     }
@@ -588,7 +646,11 @@ def _verify_candidates_reuse_source(
     target = [float(physics["target_energy_eV"][0]), float(physics["target_energy_eV"][1])]
     if list(spec.get("target_energy_eV") or []) != target:
         raise ValueError("候选目标能窗不一致，拒绝复用 candidates")
-    if spec.get("candidate_policy") != policy:
+    spec_policy = _canonicalize_candidate_policy(
+        spec.get("candidate_policy") or {}, source="candidate-spec"
+    )
+    expected_policy = _canonicalize_candidate_policy(policy, source="config")
+    if spec_policy != expected_policy:
         raise ValueError("候选策略不一致，拒绝复用 candidates")
     files = [spec_path]
     for dos in sorted(root.glob("03_candidates/pyw90-dos-*.json")):

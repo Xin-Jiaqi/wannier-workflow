@@ -191,7 +191,12 @@ def _prior_candidates_spec(overrides: dict | None = None) -> dict:
             "shell_family_min_weight": 0.08,
             "shell_combination_min_weight": 0.45,
             "chemical_valence_used": False,
-            "pyw90_dos": {"enabled": False, "required": False, "lower_bound": 0.1},
+            "pyw90_dos": {
+                "enabled": False,
+                "required": False,
+                "lower_bound": 0.1,
+                "role": "optional_projection_baseline_not_authoritative_decision",
+            },
         },
     }
     if overrides:
@@ -440,10 +445,59 @@ class CandidatesReuseTests(unittest.TestCase):
             config, poscar, work = _fixture(Path(temporary))
             plan = _plan(config, work)
             prior = self._prior_wannier(work, plan, spec_overrides={
-                "candidate_policy": {"max_candidates": 5},
+                "candidate_policy": {
+                    "max_candidates": 5,
+                    "max_num_wann_fraction_of_bands": 1.0,
+                    "shell_family_min_weight": 0.08,
+                    "shell_combination_min_weight": 0.45,
+                    "chemical_valence_used": False,
+                    "pyw90_dos": {"enabled": False, "required": False, "lower_bound": 0.1},
+                },
             })
-            with self.assertRaisesRegex(ValueError, "候选策略"):
+            with self.assertRaisesRegex(ValueError, "候选策略不一致"):
                 coldstart.verify_reuse_source(prior, config, plan)
+
+    def test_candidate_policy_metadata_fields_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config, poscar, work = _fixture(Path(temporary))
+            plan = _plan(config, work)
+            spec = _prior_candidates_spec()
+            spec["candidate_policy"]["pyw90_dos"]["description"] = "informational"
+            spec["candidate_policy"]["pyw90_dos"]["comment"] = "ignored"
+            prior = self._prior_wannier(work, plan, spec_overrides=spec)
+            reuse = coldstart.verify_reuse_source(prior, config, plan)
+            self.assertEqual(reuse["stages"]["candidates"]["stage_status"], "PASS")
+
+    def test_candidate_policy_unknown_field_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config, poscar, work = _fixture(Path(temporary))
+            plan = _plan(config, work)
+            spec = _prior_candidates_spec()
+            spec["candidate_policy"]["coverage_bias"] = 0.5
+            prior = self._prior_wannier(work, plan, spec_overrides=spec)
+            with self.assertRaisesRegex(ValueError, "未知字段.*coverage_bias"):
+                coldstart.verify_reuse_source(prior, config, plan)
+
+    def test_candidate_policy_canonicalization_stable(self) -> None:
+        base = _prior_candidates_spec()["candidate_policy"]
+        first = coldstart._canonicalize_candidate_policy(base, source="test")
+        second = coldstart._canonicalize_candidate_policy(
+            {
+                **base,
+                "pyw90_dos": {
+                    **base["pyw90_dos"],
+                    "note": "ignored metadata",
+                },
+            },
+            source="test",
+        )
+        self.assertEqual(first, second)
+        self.assertNotIn("role", first["pyw90_dos"])
+        changed = {
+            **base,
+            "pyw90_dos": {**base["pyw90_dos"], "lower_bound": 0.2},
+        }
+        self.assertNotEqual(first, coldstart._canonicalize_candidate_policy(changed, source="test"))
 
     def test_apply_reuse_candidates_copies_with_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
