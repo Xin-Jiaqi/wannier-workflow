@@ -11,6 +11,7 @@ from .paths import runs_root
 from .attempts import create_attempts, import_completed_attempt, run_attempt
 from .candidates import suggest_projection_candidates
 from .executor import finalize_run, generate_candidates, import_completed_stage, prepare_run, reconcile_stage, run_vasp_stage
+from .japan_runner import site_qstat_active, site_qsub, submit_material
 from .parsers import parse_eigenval, parse_poscar
 from .pipeline import audit_reference, plan_project
 from .pyw90_adapter import run_eig_suggest
@@ -183,6 +184,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="继续已有非终态 campaign（成功 stage 不重跑，遵循现有 retry 语义）",
     )
     run_material_parser.add_argument("--poll-seconds", type=float, default=30.0)
+
+    submit_material_parser = sub.add_parser(
+        "submit-material",
+        help="通用 Japan Stage-1 PBS 提交入口：material 必须存在于受控 cases manifest，"
+             "无材料白名单；提交前只读 preflight 并防重复",
+    )
+    submit_material_parser.add_argument("--material", required=True, help="受控 material_id（manifest 键）")
+    submit_material_parser.add_argument("--release", required=True, help="release 根目录（路径由 release/pool 根派生）")
+    submit_material_parser.add_argument("--work-root", required=True, help="runs/campaigns 根目录（immutable）")
+    submit_material_parser.add_argument("--pool", default=None, help="可选：pool 根目录覆盖（默认 release 下 test-pool-v01）")
+    submit_material_parser.add_argument("--manifest", default=None, help="可选：cases manifest 覆盖（默认 release/CONTROL/input-lock.json）")
+    submit_material_parser.add_argument("--python", default=None, help="可选：job 内 Python 解释器（默认 python3）")
+    submit_material_parser.add_argument("--expected-commit", default=None, help="期望的 release source commit（可选强校验）")
+    submit_material_parser.add_argument("--poll-seconds", type=float, default=60.0)
+    submit_material_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只读：preflight + 渲染 PBS 脚本，不写状态、不 qsub",
+    )
+    submit_material_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="允许继续已有非终态 campaign（否则已存在 campaign 会被 preflight 拒绝）",
+    )
 
     inspect = sub.add_parser("inspect", help="只读显示自动状态机的下一动作")
     inspect.add_argument("run_dir")
@@ -437,6 +462,32 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             _emit(result)
             return int(result["exit_code"])
+        elif args.command == "submit-material":
+            try:
+                result = submit_material(
+                    material_id=args.material,
+                    release_root=args.release,
+                    work_root=args.work_root,
+                    manifest_path=args.manifest,
+                    pool_root=args.pool,
+                    python=args.python,
+                    expected_release_commit=args.expected_commit,
+                    dry_run=args.dry_run,
+                    resume=args.resume,
+                    poll_seconds=args.poll_seconds,
+                    active_check=None if args.dry_run else site_qstat_active,
+                    qsub=None if args.dry_run else site_qsub,
+                )
+            except (ValueError, RuntimeError) as exc:
+                _emit({
+                    "mode": "ERROR",
+                    "error_type": type(exc).__name__,
+                    "reason": str(exc),
+                    "exit_code": 1,
+                })
+                return 1
+            _emit(result)
+            return 0 if result.get("passed") else 1
         elif args.command == "audit-ranking":
             with Path(args.ranking_json).open("r", encoding="utf-8") as handle:
                 result = audit_ranking_document(json.load(handle))

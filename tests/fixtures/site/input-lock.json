@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "cases": {
+    "LiAuI4_BL": {
+      "config_sha256": "cf2bd4c0ab29c54e64c1102fc8659c27824cf607e4b73e41f426634f552a3eee",
+      "poscar_sha256": "8513ce6f6f7e0a32bf5e26d296ccef567503e36de2bd3b767fdad334d275cba3",
+      "potcar_combined_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "PdS2_BL": {
+      "config_sha256": "ef48e5551fa51c22f620ce3a2e535ff95ef5bbe9ad65a11025036e69472f48f8",
+      "poscar_sha256": "dc1b408e608d3651613606d4cf473629c4c221a57560a7f848770ffa31791e3b",
+      "potcar_combined_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "ZrI2_BL": {
+      "config_sha256": "ccc9d566c0544135e51a6b692f6231006b3481fe6f2da41ccd30abe76866945e",
+      "poscar_sha256": "2436a8aff2ea19e1f66a7ebe3dffc7c38314c3cafce6069b2665c38600851895",
+      "potcar_combined_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "X2Y_BL": {
+      "config_sha256": "33076d056af2455b68ea91ac379ccf105e7bd4c5515ea74529d8f2c2bea3d784",
+      "poscar_sha256": "a81e39d652abbef1e719f2fd18574fd63567272877f7eac2d375b1a0f9810c63",
+      "potcar_combined_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "EVIL_BL": {
+      "config_sha256": "5dd5384bdd6758c2d3c40b048a33ca8e71a7f52e49bb06cd6074270241054430",
+      "poscar_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "scientific_inputs": {
+    "note": "synthetic site fixture for japan_runner tests"
+  },
+  "site": {
+    "scheduler": "pbs",
+    "standard_allocation": "select=1:ncpus=32:mpiprocs=32:ompthreads=1:mem=128gb"
+  }
+}
