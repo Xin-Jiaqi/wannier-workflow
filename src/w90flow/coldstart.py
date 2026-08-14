@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import socket
 import time
 from datetime import datetime, timezone
@@ -27,7 +28,7 @@ from .preprocess import (
     validate_incar_structure_compatibility,
     validate_potcar_recipe,
 )
-from .state import atomic_json, read_json, sha256_file
+from .state import atomic_json, read_json, sha256_file, update_stage
 from .structure import resolve_periodicity
 from .supervisor import supervise_workflow
 
@@ -471,6 +472,233 @@ def _advance_preprocess(
         raise RuntimeError(f"{structure_id} preprocess 未通过：{result}")
 
 
+def _verify_preprocess_reuse_source(
+    preprocess_run: str | Path,
+    structure: dict[str, Any],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Read-only verification of one prior preprocess/SCF/Band source.
+
+    Scientific fingerprint = protocol_sha256 + POSCAR + POTCAR combined +
+    INCAR/KPOINTS template hashes + PASS stage status + complete band handoff.
+    Launcher/commands and Python paths are deliberately NOT part of the
+    fingerprint, so a pure environment fix keeps reuse valid.
+    """
+    root = Path(preprocess_run).expanduser().resolve()
+    sid = str(structure["id"])
+    protocol_path = root / "protocol.json"
+    lock_path = root / "input-lock.json"
+    if not protocol_path.is_file() or not lock_path.is_file():
+        raise ValueError(f"{sid} reuse 源不是完整 preprocess run（缺 protocol.json/input-lock.json）：{root}")
+    expected_protocol = str(structure["preprocess_protocol_sha256"])
+    stored_protocol = read_json(protocol_path)
+    if str(stored_protocol.get("protocol_sha256") or "") != expected_protocol:
+        raise ValueError(
+            f"{sid} 科学协议哈希不一致（protocol 变化，拒绝复用）："
+            f"{stored_protocol.get('protocol_sha256', '?')[:8]}… != {expected_protocol[:8]}…"
+        )
+    input_lock = read_json(lock_path)
+    locked_poscar = (input_lock.get("files") or {}).get("POSCAR") or {}
+    if locked_poscar.get("sha256") != str(structure["poscar_sha256"]):
+        raise ValueError(f"{sid} POSCAR 哈希不一致，拒绝复用")
+    materialized = input_lock.get("materialized_files") or {}
+    potcar_record = materialized.get("POTCAR") or {}
+    expected_potcar = (structure.get("preflight") or {}).get("potcar", {}).get("combined_sha256")
+    if not expected_potcar or potcar_record.get("sha256") != expected_potcar:
+        raise ValueError(f"{sid} POTCAR combined 哈希不一致，拒绝复用")
+    templates = (plan.get("immutable_input_sha256") or {}).get("preprocess_templates") or {}
+    active = sorted((structure.get("preflight") or {}).get("incar") or {})
+    if not active:
+        raise ValueError(f"{sid} 当前计划无激活 preprocess 阶段，拒绝复用")
+    template_hashes: dict[str, str] = {}
+    for stage in active:
+        for role in ("incar", "kpoints"):
+            record = materialized.get(f"{stage}:{role.upper()}") or {}
+            expected = templates.get(f"{stage}:{role}")
+            if not record.get("sha256") or record["sha256"] != expected:
+                raise ValueError(f"{sid} {stage} {role} 模板哈希不一致（kmesh/INCAR 变化，拒绝复用）")
+            template_hashes[f"{stage}:{role}"] = record["sha256"]
+        state_path = root / stage / "stage.json"
+        if not state_path.is_file():
+            raise ValueError(f"{sid} 缺少 {stage}/stage.json，拒绝复用")
+        status = str(read_json(state_path).get("status"))
+        if status != "PASS":
+            raise ValueError(f"{sid}/{stage} 状态是 {status}（非 PASS），拒绝复用")
+    handoff_path = root / "03_band/band-handoff.json"
+    if not handoff_path.is_file():
+        raise ValueError(f"{sid} 缺少 03_band/band-handoff.json（Band 未交接），拒绝复用")
+    handoff_files = read_json(handoff_path).get("files")
+    if not isinstance(handoff_files, dict) or not handoff_files:
+        raise ValueError(f"{sid} band-handoff 无 files 记录，拒绝复用")
+    for name, record in handoff_files.items():
+        path = root / "03_band" / name
+        if not isinstance(record, dict) or not path.is_file() or record.get("sha256") != sha256_file(path):
+            raise ValueError(f"{sid} Band 产物 {name} 缺失或哈希改变，拒绝复用")
+    return {
+        "source_run": str(root),
+        "source_stage": "preprocess",
+        "stage_status": "PASS",
+        "hashes": {
+            "protocol_sha256": expected_protocol,
+            "poscar_sha256": str(structure["poscar_sha256"]),
+            "potcar_sha256": str(expected_potcar),
+            "templates": template_hashes,
+        },
+    }
+
+
+def _verify_candidates_reuse_source(
+    wannier_prior: str | Path,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Read-only verification of a prior PASS 03_candidates stage."""
+    root = Path(wannier_prior).expanduser().resolve()
+    stage_path = root / "03_candidates/stage.json"
+    spec_path = root / "03_candidates/candidate-spec.json"
+    if not stage_path.is_file() or str(read_json(stage_path).get("status")) != "PASS":
+        raise ValueError(f"候选源 03_candidates 不是 PASS，拒绝复用：{root}")
+    if not spec_path.is_file():
+        raise ValueError(f"候选源缺少 candidate-spec.json，拒绝复用：{root}")
+    spec = read_json(spec_path)
+    physics = config.get("physics") or {}
+    candidates = config.get("candidates") or {}
+    pyw90 = candidates.get("pyw90_dos") or {}
+    policy = {
+        "max_candidates": int(candidates.get("max_candidates", 8)),
+        "max_num_wann_fraction_of_bands": float(candidates.get("max_num_wann_fraction_of_bands", 1.0)),
+        "shell_family_min_weight": float(candidates.get("shell_family_min_weight", 0.08)),
+        "shell_combination_min_weight": float(candidates.get("shell_combination_min_weight", 0.45)),
+        "chemical_valence_used": bool(candidates.get("chemical_valence")),
+        "pyw90_dos": {
+            "enabled": bool(pyw90.get("enabled", False)),
+            "required": bool(pyw90.get("required", False)),
+            "lower_bound": float(pyw90.get("lower_bound", 0.1)),
+        },
+    }
+    if spec.get("ensemble_mode") != str(config.get("ensemble", {}).get("mode", "independent")):
+        raise ValueError("候选 ensemble 模式不一致，拒绝复用 candidates")
+    if bool(spec.get("soc")) != bool(physics.get("soc")):
+        raise ValueError("候选 SOC 设定不一致，拒绝复用 candidates")
+    if spec.get("energy_reference") != physics.get("energy_reference"):
+        raise ValueError("候选能量参考不一致，拒绝复用 candidates")
+    target = [float(physics["target_energy_eV"][0]), float(physics["target_energy_eV"][1])]
+    if list(spec.get("target_energy_eV") or []) != target:
+        raise ValueError("候选目标能窗不一致，拒绝复用 candidates")
+    if spec.get("candidate_policy") != policy:
+        raise ValueError("候选策略不一致，拒绝复用 candidates")
+    files = [spec_path]
+    for dos in sorted(root.glob("03_candidates/pyw90-dos-*.json")):
+        files.append(dos)
+    return {
+        "source_run": str(root),
+        "source_stage": "03_candidates",
+        "stage_status": "PASS",
+        "files": [{"path": str(path), "sha256": sha256_file(path)} for path in files],
+        "candidate_spec_sha256": sha256_file(spec_path),
+    }
+
+
+def verify_reuse_source(
+    prior_run: str | Path,
+    config_file: str | Path,
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Read-only gate for ``--reuse-from`` (technical-recovery cross-run reuse).
+
+    The prior run is never modified.  Only PASS preprocess/SCF/band (and,
+    when the prior run is a Stage1 Wannier run, PASS 03_candidates) with a
+    hash-identical scientific fingerprint are accepted.  Parent references are
+    resolved through the prior run's own import manifests, never guessed.
+    """
+    prior = Path(prior_run).expanduser().resolve()
+    config = load_project(Path(config_file).expanduser().resolve())
+    if not prior.is_dir():
+        raise ValueError(f"--reuse-from 目标不是目录：{prior}")
+    if (prior / "protocol.json").is_file() and (prior / "input-lock.json").is_file():
+        preprocess_sources = {str(item["id"]): str(prior) for item in plan["structures"]}
+        candidates_info = None
+    elif (prior / "03_candidates/stage.json").is_file():
+        preprocess_sources = {}
+        for item in plan["structures"]:
+            sid = str(item["id"])
+            manifest = prior / "structures" / sid / "02_scf/import-manifest.json"
+            if not manifest.is_file():
+                raise ValueError(f"候选源无法解析 SCF parent run（{manifest} 不存在，拒绝猜测目录）")
+            results = read_json(manifest).get("results") or []
+            if not results or not results[0].get("source"):
+                raise ValueError(f"SCF import manifest 无 source 记录：{manifest}")
+            parent = Path(str(results[0]["source"])).expanduser().resolve().parent
+            if not parent.is_dir():
+                raise ValueError(f"SCF parent run 不存在：{parent}")
+            preprocess_sources[sid] = str(parent)
+        candidates_info = _verify_candidates_reuse_source(prior, config)
+    else:
+        raise ValueError(
+            "--reuse-from 必须是 preprocess run（含 protocol.json/input-lock.json）"
+            "或 Stage1 Wannier run（含 03_candidates）"
+        )
+    preprocess_verified: dict[str, Any] = {}
+    for item in plan["structures"]:
+        sid = str(item["id"])
+        source = preprocess_sources[sid]
+        preprocess_verified[sid] = _verify_preprocess_reuse_source(source, item, plan)
+    stages: dict[str, Any] = {"preprocess": preprocess_verified}
+    for sid, verified in preprocess_verified.items():
+        stages.setdefault("scf", {})[sid] = {
+            "source_run": preprocess_sources[sid],
+            "source_stage": "02_scf",
+            "stage_status": "PASS",
+        }
+        stages.setdefault("band", {})[sid] = {
+            "source_run": preprocess_sources[sid],
+            "source_stage": "03_band",
+            "stage_status": "PASS",
+        }
+    if candidates_info is not None:
+        stages["candidates"] = candidates_info
+    return {
+        "schema_version": 1,
+        "mode": "technical_recovery_reuse",
+        "prior_run": str(prior),
+        "preprocess_sources": preprocess_sources,
+        "candidates": candidates_info,
+        "stages": stages,
+    }
+
+
+def _apply_reuse_candidates(wannier_run: Path, candidates_info: dict[str, Any]) -> dict[str, Any]:
+    """Copy hash-verified candidate artifacts into the new immutable run."""
+    target = wannier_run / "03_candidates"
+    target.mkdir(parents=True, exist_ok=True)
+    copied: list[dict[str, Any]] = []
+    for record in candidates_info.get("files") or []:
+        source = Path(str(record["path"])).expanduser().resolve()
+        if not source.is_file():
+            raise ValueError(f"候选源文件缺失：{source}")
+        if sha256_file(source) != record.get("sha256"):
+            raise ValueError(f"候选源文件哈希改变：{source}")
+        destination = target / source.name
+        if not destination.exists():
+            try:
+                os.link(source, destination)
+            except OSError:
+                shutil.copy2(source, destination)
+        elif sha256_file(destination) != record["sha256"]:
+            raise ValueError(f"候选目标已存在且哈希不同：{destination}")
+        copied.append({"source": str(source), "target": str(destination), "sha256": record["sha256"]})
+    update_stage(
+        wannier_run,
+        "03_candidates",
+        status="PASS",
+        reused_utc=_utc_now(),
+        provenance={
+            "source_run": str(candidates_info.get("source_run")),
+            "source_stage": "03_candidates",
+        },
+    )
+    return {"stage": "03_candidates", "status": "PASS", "copied": copied}
+
+
 def run_stage1_coldstart(
     config_path: str | Path,
     campaign_dir: str | Path,
@@ -479,6 +707,7 @@ def run_stage1_coldstart(
     execute: bool = False,
     poll_seconds: float = 30.0,
     python: str | None = None,
+    reuse: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     plan = plan_stage1_coldstart(config_path, campaign_dir, runs_root)
     if not execute:
@@ -528,6 +757,15 @@ def run_stage1_coldstart(
             sid = str(structure["id"])
             poscar = Path(structure["poscar_resolved"])
             protocol, inputs = _resolve_preprocess_inputs(config_file, poscar)
+            plan_item = next(item for item in plan["structures"] if item["id"] == sid)
+            if reuse and reuse.get("preprocess_sources", {}).get(sid):
+                preprocess_run = Path(reuse["preprocess_sources"][sid])
+                verified = _verify_preprocess_reuse_source(preprocess_run, plan_item, plan)
+                state.setdefault("preprocess_reuse", {})[sid] = verified
+                _save(state_path, state, "PREPROCESS_REUSED", current_structure=sid,
+                      source_run=str(preprocess_run))
+                sources[sid] = str(preprocess_run)
+                continue
             preprocess_run = Path(state["preprocess_runs"][sid])
             if not preprocess_run.exists():
                 _save(state_path, state, "PREPROCESS_PREPARING", current_structure=sid)
@@ -574,6 +812,19 @@ def run_stage1_coldstart(
             )
             if Path(bootstrapped["run_dir"]) != wannier_run:
                 raise RuntimeError("bootstrap 返回了非预期的 Wannier run_dir。")
+            if reuse:
+                provenance = {
+                    "schema_version": 1,
+                    "mode": "technical_recovery_reuse",
+                    "created_utc": _utc_now(),
+                    "prior_run": reuse["prior_run"],
+                    "stages": reuse["stages"],
+                    "imported_via": "fit_from_preprocess/import_completed_stage (hash-verified parent references)",
+                }
+                if reuse.get("candidates"):
+                    applied = _apply_reuse_candidates(wannier_run, reuse["candidates"])
+                    provenance["candidates_files"] = applied["copied"]
+                atomic_json(wannier_run / "00_reuse/provenance.json", provenance)
             _save(state_path, state, "WANNIER_BOOTSTRAPPED", preprocess_sources=sources)
 
         _save(state_path, state, "WANNIER_RUNNING", wannier_run=str(wannier_run))

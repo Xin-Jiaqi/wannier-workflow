@@ -24,6 +24,7 @@ from .coldstart import (
     derived_wannier_run,
     plan_stage1_coldstart,
     run_stage1_coldstart,
+    verify_reuse_source,
 )
 from .config import load_project
 from .orchestrator import CONVERGENCE_FAILURES, STAGE_NAME, WINDOW_FAILURES
@@ -154,6 +155,8 @@ def material_plan(
         "exit_code": EXIT_OK,
         "stage_plan": steps,
         "reuse": _reuse_report(config, plan, runs, signature_sha256),
+        "structures": plan["structures"],
+        "immutable_input_sha256": plan["immutable_input_sha256"],
         "preflight": plan["preflight"],
         "sequence": plan["sequence"],
     }
@@ -284,17 +287,35 @@ def run_material(
     resume: bool = False,
     poll_seconds: float = 30.0,
     python: str | None = None,
+    reuse_from: str | Path | None = None,
 ) -> dict[str, Any]:
     """Deterministic single-material production entry.
 
     ``--dry-run`` is read-only: it returns the stage plan, input fingerprints
     and reuse conditions and creates no state.  ``--resume`` continues an
     existing non-terminal campaign; PASS stages are never rerun (delegated to
-    the coldstart state machine).  Exit code 0 does not mean scientific success:
-    the machine-readable ``status`` is authoritative.
+    the coldstart state machine).  ``--reuse-from`` is an explicit
+    technical-recovery switch (default off): it reuses hash-identical PASS
+    preprocess/SCF/band (and PASS 03_candidates when the prior run is a Stage1
+    Wannier run) from a prior run, read-only, with provenance.  Failed
+    04_wannier and later stages are never reused.  Exit code 0 does not mean
+    scientific success: the machine-readable ``status`` is authoritative.
     """
     plan = material_plan(poscar, material_id, config_path, work_root)
+    reuse = None
+    prior_run_path: str | None = None
+    if reuse_from is not None:
+        config_file_for_reuse = Path(config_path).expanduser().resolve()
+        prior = Path(reuse_from).expanduser().resolve()
+        prior_run_path = str(prior)
+        reuse = verify_reuse_source(prior, config_file_for_reuse, plan)
     if dry_run:
+        if reuse is not None:
+            plan = {
+                **plan,
+                "reuse_from": prior_run_path,
+                "reuse_verification": reuse,
+            }
         return plan
     if poll_seconds <= 0:
         raise ValueError("poll_seconds 必须大于 0。")
@@ -335,6 +356,8 @@ def run_material(
         "updated_utc": _utc_now(),
         "stage_plan": plan["stage_plan"],
         "reuse": plan["reuse"],
+        "reuse_from": prior_run_path,
+        "reuse_stages": reuse["stages"] if reuse else None,
     })
     atomic_json(manifest_path, manifest)
 
@@ -346,6 +369,7 @@ def run_material(
             execute=True,
             poll_seconds=poll_seconds,
             python=python,
+            reuse=reuse,
         )
     except Exception as exc:  # noqa: BLE001 - production entry records any failure
         manifest.update({

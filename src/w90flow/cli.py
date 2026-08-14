@@ -190,6 +190,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Stage1 supervisor/子进程 Python（默认继承本进程 sys.executable，禁止裸 python3）",
     )
+    run_material_parser.add_argument(
+        "--reuse-from",
+        default=None,
+        metavar="PRIOR_RUN",
+        help="技术恢复：只读跨 run 复用科学指纹完全一致的 PASS preprocess/SCF/band/candidates；"
+             "默认关闭；失败 04_wannier 及之后绝不复用；prior run 只读、不假装新计算",
+    )
 
     submit_material_parser = sub.add_parser(
         "submit-material",
@@ -469,6 +476,7 @@ def main(argv: list[str] | None = None) -> int:
                     resume=args.resume,
                     poll_seconds=args.poll_seconds,
                     python=args.python,
+                    reuse_from=args.reuse_from,
                 )
             except (ValueError, RuntimeError) as exc:
                 _emit({
