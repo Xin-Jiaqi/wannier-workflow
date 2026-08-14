@@ -168,6 +168,17 @@ class PbsTemplateTests(unittest.TestCase):
         self.assertIn('material_id not in lock.get("cases", {})', script)
         self.assertNotIn("BiI3_BL|SnO_BL|ZrI2_BL|NbO2I_BL", script)
 
+    def test_reuse_from_passes_through_when_explicit(self) -> None:
+        script = self._render(reuse_from="/work/prior/run-001")
+        self.assertIn("REUSE_FROM='/work/prior/run-001'", script)
+        self.assertIn('if [ -n "$REUSE_FROM" ]', script)
+        self.assertIn("ARGS+=(--reuse-from \"$REUSE_FROM\")", script)
+
+    def test_reuse_from_absent_by_default(self) -> None:
+        script = self._render()
+        self.assertIn("REUSE_FROM=''", script)
+        self.assertNotIn("REUSE_FROM='/", script)
+
 
 class SubmitMaterialTests(unittest.TestCase):
     def _submit(self, work_root: Path, **overrides: object) -> dict:
@@ -214,6 +225,23 @@ class SubmitMaterialTests(unittest.TestCase):
             script = script_path.read_text(encoding="utf-8")
             self.assertIn("DRY_RUN=0", script)
             self.assertIn("RESUME=0", script)
+            self.assertIsNone(spec["reuse_from"])
+
+    def test_real_submit_records_reuse_from_in_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary) / "work"
+            qsub = mock.Mock(return_value={"job_id": "77778.japan", "output": "77778.japan"})
+            result = self._submit(
+                work,
+                reuse_from="/work/prior/run-001",
+                active_check=lambda material: [],
+                qsub=qsub,
+            )
+            self.assertEqual(result["mode"], "SUBMITTED")
+            spec = json.loads(Path(result["spec_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(spec["reuse_from"], "/work/prior/run-001")
+            script = Path(result["pbs_path"]).read_text(encoding="utf-8")
+            self.assertIn("--reuse-from \"$REUSE_FROM\"", script)
 
     def test_active_duplicate_blocks_submission(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

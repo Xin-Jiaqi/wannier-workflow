@@ -221,6 +221,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="允许继续已有非终态 campaign（否则已存在 campaign 会被 preflight 拒绝）",
     )
+    submit_material_parser.add_argument(
+        "--reuse-from",
+        default=None,
+        metavar="PRIOR_RUN",
+        help="技术恢复：原样传给 run-material --reuse-from（跨 run 复用指纹一致的 PASS 阶段，默认关闭）",
+    )
 
     doctor = sub.add_parser(
         "doctor",
@@ -501,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
                     dry_run=args.dry_run,
                     resume=args.resume,
                     poll_seconds=args.poll_seconds,
+                    reuse_from=args.reuse_from,
                     active_check=None if args.dry_run else site_qstat_active,
                     qsub=None if args.dry_run else site_qsub,
                 )

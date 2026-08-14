@@ -57,6 +57,7 @@ CONFIG='%%CONFIG%%'
 DRY_RUN=%%DRY_RUN%%
 RESUME=%%RESUME%%
 POLL_SECONDS=%%POLL_SECONDS%%
+REUSE_FROM='%%REUSE_FROM%%'
 
 if [[ ! -x "$PYTHON" ]]; then
   echo "python not executable: $PYTHON" >&2
@@ -98,6 +99,9 @@ if [ "$RESUME" = "1" ]; then
   ARGS+=(--resume)
 fi
 ARGS+=(--python "$PYTHON")
+if [ -n "$REUSE_FROM" ]; then
+  ARGS+=(--reuse-from "$REUSE_FROM")
+fi
 exec "$PYTHON" -m w90flow "${ARGS[@]}"
 """
 
@@ -361,6 +365,7 @@ def render_stage1_pbs(
     dry_run: bool = False,
     resume: bool = False,
     poll_seconds: float = 60.0,
+    reuse_from: str | Path | None = None,
 ) -> str:
     """Render the generic PBS script from validated, root-derived fields only."""
     material_id = validate_material_id(material_id)
@@ -377,6 +382,7 @@ def render_stage1_pbs(
         "DRY_RUN": "1" if dry_run else "0",
         "RESUME": "1" if resume else "0",
         "POLL_SECONDS": str(float(poll_seconds)),
+        "REUSE_FROM": str(Path(reuse_from).expanduser().resolve()) if reuse_from else "",
     }
     script = STAGE1_MATERIAL_PBS
     for token, value in values.items():
@@ -398,6 +404,7 @@ def submit_material(
     dry_run: bool = False,
     resume: bool = False,
     poll_seconds: float = 60.0,
+    reuse_from: str | Path | None = None,
     active_check: Callable[[str], list[str]] | None = None,
     qsub: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -442,6 +449,7 @@ def submit_material(
             dry_run=True,
             resume=resume,
             poll_seconds=poll_seconds,
+            reuse_from=reuse_from,
         )
         return {
             **preflight,
@@ -479,6 +487,7 @@ def submit_material(
         dry_run=False,
         resume=resume,
         poll_seconds=poll_seconds,
+        reuse_from=reuse_from,
     )
     submissions = Path(work_root).expanduser().resolve() / "submissions"
     submissions.mkdir(parents=True, exist_ok=True)
@@ -500,6 +509,7 @@ def submit_material(
             "work_root": str(Path(work_root).expanduser().resolve()),
             "dry_run": False,
             "resume": resume,
+            "reuse_from": str(Path(reuse_from).expanduser().resolve()) if reuse_from else None,
             "submitted_utc": stamp,
         }, indent=2, ensure_ascii=False),
         encoding="utf-8",
