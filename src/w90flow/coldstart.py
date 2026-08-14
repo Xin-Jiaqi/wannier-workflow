@@ -563,6 +563,10 @@ def _verify_candidates_reuse_source(
     physics = config.get("physics") or {}
     candidates = config.get("candidates") or {}
     pyw90 = candidates.get("pyw90_dos") or {}
+    expected_ids = {str(item["id"]) for item in config["structures"]}
+    spec_structures = spec.get("structures")
+    if not isinstance(spec_structures, dict) or set(spec_structures) != expected_ids:
+        raise ValueError("候选结构覆盖不一致，拒绝复用 candidates")
     policy = {
         "max_candidates": int(candidates.get("max_candidates", 8)),
         "max_num_wann_fraction_of_bands": float(candidates.get("max_num_wann_fraction_of_bands", 1.0)),
@@ -598,6 +602,60 @@ def _verify_candidates_reuse_source(
     }
 
 
+def _resolve_legacy_preprocess_sources(
+    prior: Path,
+    structure_ids: list[str],
+) -> dict[str, str]:
+    """Resolve preprocess parents from dfb26b5-era root-level import manifests.
+
+    Legacy Stage1 Wannier runs recorded explicit parent references in
+    ``02_scf/import-manifest.json`` and ``03_band/import-manifest.json`` at the
+    run root (``results[].source`` points into the preprocess run).  Directory
+    paths are never guessed: when either manifest or a per-structure record is
+    missing, the caller must pass the preprocess run directly as
+    ``--reuse-from``.
+    """
+    manifests: dict[str, dict[str, dict[str, Any]]] = {}
+    for stage in ("02_scf", "03_band"):
+        manifest_path = prior / stage / "import-manifest.json"
+        if not manifest_path.is_file():
+            raise ValueError(
+                f"候选源无法解析 SCF parent run：旧版 {stage}/import-manifest.json 不存在"
+                "（新版 structures/<sid>/02_scf/import-manifest.json 也不存在）；"
+                "拒绝猜测目录，请直接传 preprocess run 作为 --reuse-from"
+            )
+        document = read_json(manifest_path)
+        results = document.get("results") if isinstance(document, dict) else None
+        if not isinstance(results, list) or not results:
+            raise ValueError(f"候选源 {stage}/import-manifest.json 无 results 记录，拒绝解析 parent")
+        by_structure: dict[str, dict[str, Any]] = {}
+        for record in results:
+            if isinstance(record, dict) and isinstance(record.get("structure"), str):
+                by_structure[str(record["structure"])] = record
+        manifests[stage] = by_structure
+    parents: dict[str, str] = {}
+    for sid in structure_ids:
+        scf_record = manifests["02_scf"].get(sid)
+        band_record = manifests["03_band"].get(sid)
+        if not scf_record or not band_record:
+            raise ValueError(
+                f"候选源（旧版布局）缺少 {sid} 的 SCF/Band parent 记录，拒绝猜测目录；"
+                "请直接传 preprocess run 作为 --reuse-from"
+            )
+        scf_source = scf_record.get("source")
+        band_source = band_record.get("source")
+        if not isinstance(scf_source, str) or not isinstance(band_source, str):
+            raise ValueError(f"候选源（旧版布局）{sid} 的 import source 无效，拒绝解析 parent")
+        scf_parent = Path(scf_source).expanduser().resolve().parent
+        band_parent = Path(band_source).expanduser().resolve().parent
+        if scf_parent != band_parent:
+            raise ValueError(f"候选源（旧版布局）{sid} 的 SCF/Band parent 不一致，拒绝复用")
+        if not scf_parent.is_dir():
+            raise ValueError(f"候选源（旧版布局）{sid} 的 SCF parent 不存在：{scf_parent}")
+        parents[sid] = str(scf_parent)
+    return parents
+
+
 def verify_reuse_source(
     prior_run: str | Path,
     config_file: str | Path,
@@ -617,21 +675,38 @@ def verify_reuse_source(
     if (prior / "protocol.json").is_file() and (prior / "input-lock.json").is_file():
         preprocess_sources = {str(item["id"]): str(prior) for item in plan["structures"]}
         candidates_info = None
+        layout_version = "preprocess"
     elif (prior / "03_candidates/stage.json").is_file():
-        preprocess_sources = {}
-        for item in plan["structures"]:
-            sid = str(item["id"])
-            manifest = prior / "structures" / sid / "02_scf/import-manifest.json"
-            if not manifest.is_file():
-                raise ValueError(f"候选源无法解析 SCF parent run（{manifest} 不存在，拒绝猜测目录）")
-            results = read_json(manifest).get("results") or []
-            if not results or not results[0].get("source"):
-                raise ValueError(f"SCF import manifest 无 source 记录：{manifest}")
-            parent = Path(str(results[0]["source"])).expanduser().resolve().parent
-            if not parent.is_dir():
-                raise ValueError(f"SCF parent run 不存在：{parent}")
-            preprocess_sources[sid] = str(parent)
+        structure_ids = [str(item["id"]) for item in plan["structures"]]
+        per_structure_manifests = [
+            prior / "structures" / sid / "02_scf/import-manifest.json"
+            for sid in structure_ids
+        ]
+        present = [manifest.is_file() for manifest in per_structure_manifests]
+        if all(present):
+            preprocess_sources = {}
+            for item in plan["structures"]:
+                sid = str(item["id"])
+                manifest = prior / "structures" / sid / "02_scf/import-manifest.json"
+                results = read_json(manifest).get("results") or []
+                if not results or not results[0].get("source"):
+                    raise ValueError(f"SCF import manifest 无 source 记录：{manifest}")
+                parent = Path(str(results[0]["source"])).expanduser().resolve().parent
+                if not parent.is_dir():
+                    raise ValueError(f"SCF parent run 不存在：{parent}")
+                preprocess_sources[sid] = str(parent)
+            layout_version = "current"
+        elif not any(present):
+            preprocess_sources = _resolve_legacy_preprocess_sources(prior, structure_ids)
+            layout_version = "legacy"
+        else:
+            raise ValueError(
+                "候选源同时含新版与旧版 SCF import manifest，拒绝猜测目录；"
+                "请直接传 preprocess run 作为 --reuse-from"
+            )
         candidates_info = _verify_candidates_reuse_source(prior, config)
+        candidates_info["source_layout_version"] = layout_version
+        candidates_info["preprocess_parents"] = dict(preprocess_sources)
     else:
         raise ValueError(
             "--reuse-from 必须是 preprocess run（含 protocol.json/input-lock.json）"
@@ -648,11 +723,15 @@ def verify_reuse_source(
             "source_run": preprocess_sources[sid],
             "source_stage": "02_scf",
             "stage_status": "PASS",
+            "source_layout_version": layout_version,
+            "hashes": verified["hashes"],
         }
         stages.setdefault("band", {})[sid] = {
             "source_run": preprocess_sources[sid],
             "source_stage": "03_band",
             "stage_status": "PASS",
+            "source_layout_version": layout_version,
+            "hashes": verified["hashes"],
         }
     if candidates_info is not None:
         stages["candidates"] = candidates_info
@@ -660,6 +739,7 @@ def verify_reuse_source(
         "schema_version": 1,
         "mode": "technical_recovery_reuse",
         "prior_run": str(prior),
+        "source_layout_version": layout_version,
         "preprocess_sources": preprocess_sources,
         "candidates": candidates_info,
         "stages": stages,

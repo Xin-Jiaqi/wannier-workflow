@@ -184,6 +184,7 @@ def _prior_candidates_spec(overrides: dict | None = None) -> dict:
         "soc": False,
         "energy_reference": "fermi_relative",
         "target_energy_eV": [-6.0, 4.0],
+        "structures": {"XY2": {"orbital_scores": {}}},
         "candidate_policy": {
             "max_candidates": 3,
             "max_num_wann_fraction_of_bands": 1.0,
@@ -236,6 +237,10 @@ class PreprocessReuseTests(unittest.TestCase):
             hashes = reuse["stages"]["preprocess"]["XY2"]["hashes"]
             self.assertEqual(hashes["protocol_sha256"], plan["structures"][0]["preprocess_protocol_sha256"])
             self.assertEqual(hashes["poscar_sha256"], plan["structures"][0]["poscar_sha256"])
+            self.assertEqual(reuse["source_layout_version"], "preprocess")
+            self.assertEqual(reuse["stages"]["scf"]["XY2"]["source_layout_version"], "preprocess")
+            self.assertEqual(reuse["stages"]["scf"]["XY2"]["hashes"], hashes)
+            self.assertEqual(reuse["stages"]["band"]["XY2"]["hashes"], hashes)
             self.assertNotIn("04_wannier", reuse["stages"])
 
     def test_poscar_change_rejected(self) -> None:
@@ -301,6 +306,40 @@ class CandidatesReuseTests(unittest.TestCase):
         (prior / "04_wannier/stage.json").write_text(json.dumps({"status": "FAIL"}), encoding="utf-8")
         return prior
 
+    def _prior_wannier_legacy(self, work: Path, plan: dict, *, spec_overrides: dict | None = None,
+                              with_scf_evidence: bool = True, with_band_evidence: bool = True,
+                              scf_source: str | None = None, band_source: str | None = None) -> Path:
+        prior_pre = _prior_preprocess(work, plan)
+        prior = work / "runs" / "prior-coldstart-legacy-0001"
+        sid = str(plan["structures"][0]["id"])
+        if with_scf_evidence:
+            scf_dir = prior / "02_scf"
+            scf_dir.mkdir(parents=True)
+            (scf_dir / "import-manifest.json").write_text(json.dumps({
+                "schema_version": 1,
+                "stage": "scf",
+                "results": [{"structure": sid, "source": scf_source or str(prior_pre / "02_scf")}],
+            }), encoding="utf-8")
+            (scf_dir / "stage.json").write_text(json.dumps({"status": "PASS"}), encoding="utf-8")
+        if with_band_evidence:
+            band_dir = prior / "03_band"
+            band_dir.mkdir(parents=True)
+            (band_dir / "import-manifest.json").write_text(json.dumps({
+                "schema_version": 1,
+                "stage": "band",
+                "results": [{"structure": sid, "source": band_source or str(prior_pre / "03_band")}],
+            }), encoding="utf-8")
+            (band_dir / "stage.json").write_text(json.dumps({"status": "PASS"}), encoding="utf-8")
+        candidates = prior / "03_candidates"
+        candidates.mkdir(parents=True)
+        (candidates / "stage.json").write_text(json.dumps({"status": "PASS"}), encoding="utf-8")
+        spec = _prior_candidates_spec(spec_overrides)
+        (candidates / "candidate-spec.json").write_text(json.dumps(spec), encoding="utf-8")
+        (candidates / "pyw90-dos-XY2.json").write_text(json.dumps({"ok": True}), encoding="utf-8")
+        (prior / "04_wannier/stage.json").parent.mkdir(parents=True)
+        (prior / "04_wannier/stage.json").write_text(json.dumps({"status": "FAIL"}), encoding="utf-8")
+        return prior
+
     def test_candidates_reused_but_wannier_failure_not(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config, poscar, work = _fixture(Path(temporary))
@@ -313,8 +352,65 @@ class CandidatesReuseTests(unittest.TestCase):
             self.assertEqual(reuse["stages"]["candidates"]["stage_status"], "PASS")
             self.assertEqual(len(reuse["stages"]["candidates"]["files"]), 2)
             self.assertNotIn("04_wannier", reuse["stages"])
+            self.assertEqual(reuse["source_layout_version"], "current")
+            self.assertEqual(reuse["stages"]["candidates"]["source_layout_version"], "current")
+            self.assertEqual(reuse["stages"]["candidates"]["preprocess_parents"]["XY2"],
+                             str((work / "runs/preprocess/prior-run-0001").resolve()))
             self.assertEqual(reuse["stages"]["preprocess"]["XY2"]["source_run"],
                              str((work / "runs/preprocess/prior-run-0001").resolve()))
+
+    def test_legacy_coldstart_parent_resolved_with_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config, poscar, work = _fixture(Path(temporary))
+            plan = _plan(config, work)
+            prior = self._prior_wannier_legacy(work, plan)
+            reuse = coldstart.verify_reuse_source(prior, config, plan)
+            self.assertEqual(reuse["source_layout_version"], "legacy")
+            parent = str((work / "runs/preprocess/prior-run-0001").resolve())
+            self.assertEqual(reuse["preprocess_sources"]["XY2"], parent)
+            self.assertEqual(reuse["stages"]["scf"]["XY2"]["source_run"], parent)
+            self.assertEqual(reuse["stages"]["scf"]["XY2"]["source_layout_version"], "legacy")
+            self.assertIn("hashes", reuse["stages"]["scf"]["XY2"])
+            self.assertEqual(reuse["stages"]["band"]["XY2"]["source_stage"], "03_band")
+            self.assertEqual(reuse["stages"]["candidates"]["source_layout_version"], "legacy")
+            self.assertEqual(reuse["stages"]["candidates"]["preprocess_parents"]["XY2"], parent)
+            self.assertNotIn("04_wannier", reuse["stages"])
+
+    def test_legacy_coldstart_without_parent_evidence_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config, poscar, work = _fixture(Path(temporary))
+            plan = _plan(config, work)
+            prior = self._prior_wannier_legacy(work, plan, with_scf_evidence=False,
+                                               with_band_evidence=False)
+            with self.assertRaisesRegex(ValueError, "直接传 preprocess run"):
+                coldstart.verify_reuse_source(prior, config, plan)
+
+    def test_legacy_coldstart_missing_band_evidence_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config, poscar, work = _fixture(Path(temporary))
+            plan = _plan(config, work)
+            prior = self._prior_wannier_legacy(work, plan, with_band_evidence=False)
+            with self.assertRaisesRegex(ValueError, "03_band/import-manifest.json"):
+                coldstart.verify_reuse_source(prior, config, plan)
+
+    def test_legacy_coldstart_scf_band_parent_mismatch_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config, poscar, work = _fixture(Path(temporary))
+            plan = _plan(config, work)
+            prior = self._prior_wannier_legacy(work, plan, band_source=str(
+                work / "runs/preprocess/other-run/03_band"))
+            with self.assertRaisesRegex(ValueError, "parent 不一致"):
+                coldstart.verify_reuse_source(prior, config, plan)
+
+    def test_legacy_candidate_structure_mismatch_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config, poscar, work = _fixture(Path(temporary))
+            plan = _plan(config, work)
+            prior = self._prior_wannier_legacy(work, plan, spec_overrides={
+                "structures": {"OTHER": {"orbital_scores": {}}},
+            })
+            with self.assertRaisesRegex(ValueError, "候选结构覆盖"):
+                coldstart.verify_reuse_source(prior, config, plan)
 
     def test_candidates_parent_resolution_requires_import_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
