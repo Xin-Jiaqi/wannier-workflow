@@ -411,6 +411,16 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(expanded[4]["retry_class"], "convergence_retry")
 
     def test_vasp54_standalone_win_preserves_candidate_dimension_and_controls(self) -> None:
+        poscar = """Synthetic L1 fixture
+1.0
+  3.000000  0.000000  0.000000
+  0.000000  3.000000  0.000000
+  0.000000  0.000000 20.000000
+X
+1
+Direct
+  0.000000  0.000000  0.500000
+"""
         incar = '''NBANDS = 48
 NUM_WANN = 22
 WANNIER90_WIN = "
@@ -429,6 +439,7 @@ precond = true
             num_wann=22,
             total_vasp_bands=64,
             plan={"mode": "exact", "exclude_bands_1_based": [*range(1, 5), *range(27, 65)]},
+            poscar_text=poscar,
         )
         self.assertIn("num_wann = 22", text)
         self.assertIn("num_bands = 22", text)
@@ -437,8 +448,21 @@ precond = true
         self.assertIn("bands_plot = true", text)
         self.assertIn("write_hr = true", text)
         self.assertNotIn("precond", text.lower())
+        self.assertIn("begin unit_cell_cart", text)
+        self.assertIn("begin atoms_cart", text)
+        self.assertRegex(text, r"X\s+0\.0000000\s+0\.0000000\s+10\.0000000")
 
     def test_vasp54_standalone_win_uses_all_bands_for_disentanglement(self) -> None:
+        poscar = """Synthetic L1 fixture
+1.0
+  3.000000  0.000000  0.000000
+  0.000000  3.000000  0.000000
+  0.000000  0.000000 20.000000
+X
+1
+Direct
+  0.000000  0.000000  0.500000
+"""
         incar = '''WANNIER90_WIN = "
 begin projections
 Mo:p
@@ -454,6 +478,7 @@ dis_win_max = 10
             num_wann=28,
             total_vasp_bands=64,
             plan={"mode": "disentanglement"},
+            poscar_text=poscar,
         )
         self.assertIn("num_wann = 28", text)
         self.assertIn("num_bands = 64", text)

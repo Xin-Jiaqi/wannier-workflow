@@ -29,6 +29,7 @@ FAILURE_TRANSITIONS = {
     "QUALITY_GATE_FAILED": "protect_target_window_then_add_next_missing_orbital_shell",
     "INVALID_WINDOW_CONTAINMENT": "regenerate_attempt_with_frozen_window_inside_outer_window",
     "INFRASTRUCTURE_FAILURE": "retry_same_attempt_once_after_environment_check",
+    "KPOINT_INDEX_ORDER_MISMATCH": "rebuild_wannier_inputs_from_one_shared_explicit_mesh",
     "NUMERIC_FAILURE": "stop_and_require_manual_diagnosis",
 }
 
@@ -337,6 +338,7 @@ def build_standalone_w90_input(
     num_wann: int,
     total_vasp_bands: int,
     plan: dict[str, Any],
+    poscar_text: str,
 ) -> str:
     """Build the pre-existing .win required by patched VASP 5.4.4.
 
@@ -365,11 +367,149 @@ def build_standalone_w90_input(
     num_bands = total_vasp_bands - len(set(excluded))
     if num_bands < num_wann:
         raise ValueError("排除能带后 NUM_BANDS 小于 NUM_WANN。")
+    cell = _poscar_cell_blocks(poscar_text)
     return (
         f"num_wann = {num_wann}\n"
         f"num_bands = {num_bands}\n\n"
-        f"{text}\n"
+        f"{text}\n\n"
+        f"{cell}"
     )
+
+
+def _poscar_cell_blocks(poscar_text: str) -> str:
+    """从 POSCAR 生成 wannier90.win 的 unit_cell_cart + atoms_cart 区块。
+
+    2026-08-13 修复（ZrI2 complete-sd/attempt-003 失败证据）：
+    build_standalone_w90_input 原先只复制 INCAR 内联 WANNIER90_WIN 块，而内联块不含
+    晶胞几何；VASP 5.4.4 MLWF 接口（wannier90 2.1.0）在缺少 unit_cell_cart/atoms_cart
+    时把 4 行投影展开为 288 个投影并与 num_wann=144 冲突，且报
+    "Did not find the cell information in the input file"。A1（模板自带 cell 块）同
+    参数可跑通，补齐 cell/atoms 块即为最小修复。
+    """
+    lines = [line for line in poscar_text.splitlines() if line.strip()]
+    if len(lines) < 8:
+        raise ValueError("POSCAR 内容不完整，无法生成 unit_cell_cart/atoms_cart。")
+    try:
+        scale = float(lines[1].split()[0])
+        lattice = [
+            [float(value) for value in row.split()[:3]]
+            for row in lines[2:5]
+        ]
+        species = lines[5].split()
+        counts = [int(value) for value in lines[6].split()[: len(species)]]
+    except (IndexError, ValueError) as exc:
+        raise ValueError(f"POSCAR 晶格/种类行非法：{exc}") from exc
+    if sum(counts) <= 0:
+        raise ValueError("POSCAR 原子数为零。")
+    index = 7
+    if lines[7].strip().lower().startswith("selective"):
+        index = 8
+    mode = lines[index].strip().lower()
+    rows = lines[index + 1 : index + 1 + sum(counts)]
+    if len(rows) != sum(counts):
+        raise ValueError("POSCAR 坐标行数与声明原子数不一致。")
+
+    cell_rows: list[str] = []
+    atom_index = 0
+    for species_index, count in enumerate(counts):
+        for _ in range(count):
+            fields = rows[atom_index].split()
+            if len(fields) < 3:
+                raise ValueError(f"POSCAR 坐标行非法：{rows[atom_index]}")
+            try:
+                coord = [float(value) for value in fields[:3]]
+            except ValueError as exc:
+                raise ValueError(f"POSCAR 坐标非数值：{rows[atom_index]}") from exc
+            if mode.startswith("direct") or mode.startswith("frac"):
+                cart = [
+                    coord[0] * lattice[0][j]
+                    + coord[1] * lattice[1][j]
+                    + coord[2] * lattice[2][j]
+                    for j in range(3)
+                ]
+            else:
+                cart = [value * scale for value in coord]
+            element = fields[3] if len(fields) >= 4 and fields[3] in species else species[species_index]
+            cell_rows.append(
+                f"{element:2s} {cart[0]:13.7f} {cart[1]:13.7f} {cart[2]:13.7f}"
+            )
+            atom_index += 1
+
+    scaled_lattice = [[value * scale for value in row] for row in lattice]
+    unit_cell = "\n".join(
+        "  %13.7f %13.7f %13.7f" % tuple(row) for row in scaled_lattice
+    )
+    return (
+        "begin unit_cell_cart\n"
+        f"{unit_cell}\n"
+        "end unit_cell_cart\n"
+        "\n"
+        "begin atoms_cart\n"
+        + "\n".join(cell_rows)
+        + "\n"
+        "end atoms_cart\n"
+    )
+
+
+def _explicit_w90_kpoints(win_text: str) -> list[list[float]]:
+    blocks = re.findall(r"(?ims)^\s*begin\s+kpoints\s*$\n(.*?)^\s*end\s+kpoints\s*$", win_text)
+    if len(blocks) != 1:
+        raise ValueError(f"wannier90.win 必须恰好包含一个 kpoints 区块，当前为 {len(blocks)} 个。")
+    points: list[list[float]] = []
+    for raw in blocks[0].splitlines():
+        if not raw.strip():
+            continue
+        fields = raw.split()
+        if len(fields) != 3:
+            raise ValueError(f"非法 Wannier90 k 点行：{raw}")
+        points.append([float(value) for value in fields])
+    return points
+
+
+def _ibzkpt_points(path: str | Path) -> list[list[float]]:
+    lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    if len(lines) < 4:
+        raise ValueError("IBZKPT 内容不完整。")
+    count = int(lines[1].split()[0])
+    rows = [line.split() for line in lines[3:3 + count]]
+    if len(rows) != count or any(len(row) < 3 for row in rows):
+        raise ValueError("IBZKPT k 点数量与声明不一致。")
+    return [[float(value) for value in row[:3]] for row in rows]
+
+
+def _wrapped_fractional_delta(left: float, right: float) -> float:
+    return abs((left - right + 0.5) % 1.0 - 0.5)
+
+
+def validate_standalone_w90_kpoint_order(
+    win_path: str | Path,
+    ibzkpt_path: str | Path,
+    *,
+    tolerance: float = 1.0e-8,
+) -> dict[str, Any]:
+    """Fail closed when VASP and Wannier90 index the same mesh differently."""
+    win_points = _explicit_w90_kpoints(Path(win_path).read_text(encoding="utf-8", errors="replace"))
+    vasp_points = _ibzkpt_points(ibzkpt_path)
+    if len(win_points) != len(vasp_points):
+        raise ValueError(
+            "KPOINT_INDEX_ORDER_MISMATCH: VASP/Wannier k 点数不同："
+            f"{len(vasp_points)} != {len(win_points)}"
+        )
+    maximum = 0.0
+    for index, (vasp, wannier) in enumerate(zip(vasp_points, win_points), 1):
+        delta = max(_wrapped_fractional_delta(a, b) for a, b in zip(vasp, wannier))
+        maximum = max(maximum, delta)
+        if delta > tolerance:
+            raise ValueError(
+                "KPOINT_INDEX_ORDER_MISMATCH: 第 "
+                f"{index} 个 VASP/Wannier k 点不同（mod 1 最大差 {delta:.3e}）。"
+            )
+    return {
+        "mode": "explicit_full_mesh_index_validation",
+        "kpoint_count": len(win_points),
+        "maximum_wrapped_fractional_delta": maximum,
+        "passed": True,
+    }
 
 
 def canonicalize_standalone_w90_kpoints(win_text: str) -> tuple[str, int]:
@@ -812,6 +952,8 @@ def classify_failure(directory: Path, returncode: int) -> str | None:
         return "DISENTANGLEMENT_NOT_CONVERGED"
     if "convergence not reached" in lower or "localisation convergence" in lower and "not" in lower:
         return "LOCALIZATION_NOT_CONVERGED"
+    if "kpoint_index_order_mismatch" in lower:
+        return "KPOINT_INDEX_ORDER_MISMATCH"
     if "nan" in lower or "segmentation fault" in lower or returncode != 0:
         return "NUMERIC_FAILURE"
     return None
@@ -917,6 +1059,7 @@ def run_attempt(
             int(record["num_wann"]),
             int(eigenval["nbands"]),
             dict(record["plan"]),
+            (directory / "POSCAR").read_text(encoding="utf-8", errors="replace"),
         )
         (directory / "wannier90.win").write_text(standalone, encoding="utf-8")
         record["standalone_w90_input"] = {
@@ -960,6 +1103,10 @@ def run_attempt(
                 try:
                     if index == 0:
                         win_path = directory / "wannier90.win"
+                        record["standalone_w90_kpoint_order"] = validate_standalone_w90_kpoint_order(
+                            win_path,
+                            directory / "IBZKPT",
+                        )
                         canonical, moved = canonicalize_standalone_w90_kpoints(
                             win_path.read_text(encoding="utf-8", errors="replace")
                         )

@@ -210,9 +210,16 @@ def prepare_run(
             elif short_stage == "band" and band_path is not None:
                 _write_exact_text(directory / "KPOINTS", band_path["kpoints_text"])
                 generated_inputs["band_kpoints"] = "native_ase_path"
-            elif short_stage in {"scf", "wannier"} and resolved_mesh:
+            elif short_stage == "wannier" and resolved_mesh:
+                # VASP 5.4.4 PEAD/Wannier runs require automatic Gamma mesh
+                # syntax.  The standalone .win remains kx-fastest and is
+                # validated against VASP's emitted IBZKPT before Wannier90.
                 _write_exact_text(directory / "KPOINTS", render_gamma_kpoints(resolved_mesh))
-                generated_inputs[f"{short_stage}_mesh"] = resolved_mesh
+                generated_inputs["wannier_mesh"] = resolved_mesh
+                generated_inputs["wannier_kpoints"] = "automatic_gamma_mesh_win_validated_against_ibzkpt"
+            elif short_stage == "scf" and resolved_mesh:
+                _write_exact_text(directory / "KPOINTS", render_gamma_kpoints(resolved_mesh))
+                generated_inputs["scf_mesh"] = resolved_mesh
             else:
                 _copy_exact(Path(templates["kpoints_resolved"]), directory / "KPOINTS")
             links[directory_name] = _link_or_copy(private_potcar, directory / "POTCAR")
