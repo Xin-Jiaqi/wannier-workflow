@@ -23,6 +23,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -56,6 +57,11 @@ CONFIG='%%CONFIG%%'
 DRY_RUN=%%DRY_RUN%%
 RESUME=%%RESUME%%
 POLL_SECONDS=%%POLL_SECONDS%%
+
+if [[ ! -x "$PYTHON" ]]; then
+  echo "python not executable: $PYTHON" >&2
+  exit 2
+fi
 
 if [[ ! "$MATERIAL_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "invalid material id: $MATERIAL_ID" >&2
@@ -91,6 +97,7 @@ fi
 if [ "$RESUME" = "1" ]; then
   ARGS+=(--resume)
 fi
+ARGS+=(--python "$PYTHON")
 exec "$PYTHON" -m w90flow "${ARGS[@]}"
 """
 
@@ -405,7 +412,7 @@ def submit_material(
     release = Path(release_root).expanduser().resolve()
     manifest = Path(manifest_path).expanduser().resolve() if manifest_path else release / DEFAULT_MANIFEST_REL
     pool = Path(pool_root).expanduser().resolve() if pool_root else release / DEFAULT_POOL_REL
-    py = str(python) if python else "python3"
+    py = str(python) if python else sys.executable
 
     preflight = material_preflight(
         material_id=material_id,

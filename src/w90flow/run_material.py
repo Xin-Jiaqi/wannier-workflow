@@ -283,6 +283,7 @@ def run_material(
     dry_run: bool = False,
     resume: bool = False,
     poll_seconds: float = 30.0,
+    python: str | None = None,
 ) -> dict[str, Any]:
     """Deterministic single-material production entry.
 
@@ -344,6 +345,7 @@ def run_material(
             runs,
             execute=True,
             poll_seconds=poll_seconds,
+            python=python,
         )
     except Exception as exc:  # noqa: BLE001 - production entry records any failure
         manifest.update({

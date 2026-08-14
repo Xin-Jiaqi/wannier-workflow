@@ -478,6 +478,7 @@ def run_stage1_coldstart(
     *,
     execute: bool = False,
     poll_seconds: float = 30.0,
+    python: str | None = None,
 ) -> dict[str, Any]:
     plan = plan_stage1_coldstart(config_path, campaign_dir, runs_root)
     if not execute:
@@ -584,6 +585,7 @@ def run_stage1_coldstart(
             heartbeat_seconds=max(60.0, poll_seconds),
             no_progress_seconds=3600.0,
             stage_timeout_seconds=172800.0,
+            python=python,
         )
         workflow = inspect_workflow(wannier_run)
         if workflow["next_action"]["action"] == "complete":

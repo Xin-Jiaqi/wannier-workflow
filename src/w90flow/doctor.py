@@ -63,6 +63,10 @@ def _platform_kind(platform: str) -> str:
 def check_python(probe: ImportProbe) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
     version = sys.version_info
+    items.append(_item(
+        "python.child", "child python (supervisor)", "PASS",
+        f"{sys.executable}（supervisor 子进程继承 sys.executable / 显式 --python）",
+    ))
     if version >= (3, 10):
         items.append(_item("python.version", "python version", "PASS",
                            f"{sys.version.split()[0]} (>=3.10)"))
@@ -150,6 +154,12 @@ def check_commands(config: dict[str, Any], work_root: str, base: Path) -> list[d
                 if not PLACEHOLDER_RE.fullmatch(match):
                     items.append(_item(f"cmd.{key}.placeholder", f"command {key} placeholder",
                                        "WARN", f"未知占位符 {match}"))
+        bare = [token for token in template if token in {"python3", "python"}]
+        if bare:
+            items.append(_item(
+                f"cmd.{key}.python", f"command {key} python", "FAIL",
+                "命令含裸 python3/python；Stage1 子进程必须使用受控解释器（sys.executable/--python）",
+            ))
         resolved, how = _resolve_wrapper(template, work_root)
         if not resolved:
             items.append(_item(f"wrap.{key}", f"wrapper {key}", "FAIL", "无法解析"))

@@ -185,6 +185,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="继续已有非终态 campaign（成功 stage 不重跑，遵循现有 retry 语义）",
     )
     run_material_parser.add_argument("--poll-seconds", type=float, default=30.0)
+    run_material_parser.add_argument(
+        "--python",
+        default=None,
+        help="Stage1 supervisor/子进程 Python（默认继承本进程 sys.executable，禁止裸 python3）",
+    )
 
     submit_material_parser = sub.add_parser(
         "submit-material",
@@ -196,7 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
     submit_material_parser.add_argument("--work-root", required=True, help="runs/campaigns 根目录（immutable）")
     submit_material_parser.add_argument("--pool", default=None, help="可选：pool 根目录覆盖（默认 release 下 test-pool-v01）")
     submit_material_parser.add_argument("--manifest", default=None, help="可选：cases manifest 覆盖（默认 release/CONTROL/input-lock.json）")
-    submit_material_parser.add_argument("--python", default=None, help="可选：job 内 Python 解释器（默认 python3）")
+    submit_material_parser.add_argument("--python", default=None, help="可选：job 内 Python 解释器（默认提交进程 sys.executable）")
     submit_material_parser.add_argument("--expected-commit", default=None, help="期望的 release source commit（可选强校验）")
     submit_material_parser.add_argument("--poll-seconds", type=float, default=60.0)
     submit_material_parser.add_argument(
@@ -231,6 +236,7 @@ def build_parser() -> argparse.ArgumentParser:
     supervise.add_argument("--no-progress-seconds", type=float, default=1800.0)
     supervise.add_argument("--stage-timeout-seconds", type=float, default=86400.0)
     supervise.add_argument("--max-hours", type=float)
+    supervise.add_argument("--python", default=None, help="child Python（默认继承本进程 sys.executable）")
 
     supervisor_status = sub.add_parser("supervisor-status", help="只读检查监督器、child 和实际 worker")
     supervisor_status.add_argument("run_dir")
@@ -420,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
                 no_progress_seconds=args.no_progress_seconds,
                 stage_timeout_seconds=args.stage_timeout_seconds,
                 max_hours=args.max_hours,
+                python=args.python,
             )
             _emit(result)
             return 0 if result.get("passed") or not args.execute else 1
@@ -461,6 +468,7 @@ def main(argv: list[str] | None = None) -> int:
                     dry_run=args.dry_run,
                     resume=args.resume,
                     poll_seconds=args.poll_seconds,
+                    python=args.python,
                 )
             except (ValueError, RuntimeError) as exc:
                 _emit({
