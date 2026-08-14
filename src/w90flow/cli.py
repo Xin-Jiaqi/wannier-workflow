@@ -36,6 +36,7 @@ from .structure import resolve_periodicity
 from .supervisor import inspect_supervisor, supervise_workflow
 from .windows import suggest_windows
 from .resources import candidate_search_plan, detect_resources
+from .doctor import doctor_cli
 
 
 def _emit(payload: Any) -> None:
@@ -208,6 +209,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="允许继续已有非终态 campaign（否则已存在 campaign 会被 preflight 拒绝）",
     )
+
+    doctor = sub.add_parser(
+        "doctor",
+        help="Stage-1 环境/契约只读检查：Python 依赖、site 命令契约、POTCAR、"
+             "MPI/PBS、work-root、跨平台路径；不启动计算、不提交作业",
+    )
+    doctor.add_argument("--config", required=True, help="Stage-1 profile 配置")
+    doctor.add_argument("--work-root", required=True, help="runs/campaigns 根目录（只检查可写性）")
+    doctor.add_argument("--json", action="store_true", help="输出机器可读 JSON（FAIL 时退出码 1）")
 
     inspect = sub.add_parser("inspect", help="只读显示自动状态机的下一动作")
     inspect.add_argument("run_dir")
@@ -488,6 +498,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             _emit(result)
             return 0 if result.get("passed") else 1
+        elif args.command == "doctor":
+            return doctor_cli(args)
         elif args.command == "audit-ranking":
             with Path(args.ranking_json).open("r", encoding="utf-8") as handle:
                 result = audit_ranking_document(json.load(handle))
