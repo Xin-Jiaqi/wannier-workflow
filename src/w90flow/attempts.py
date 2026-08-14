@@ -15,7 +15,6 @@ from typing import Any
 import yaml  # type: ignore[import-untyped]
 
 from .parsers import parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_procar_orbital_scores, parse_wout
-from .paths import launcher_root
 from .state import atomic_json, read_json, sha256_file
 from .windows import minimum_outer_max, validate_frozen_window, validate_outer_window, validate_window_containment
 
@@ -973,32 +972,82 @@ def recorded_or_classified_failure(record: dict[str, Any], directory: Path) -> s
     return classify_failure(directory, int(record.get("returncode", 1)))
 
 
-def _commands(config: dict[str, Any], directory: Path, *, mpi_processes: int | None = None) -> list[list[str]]:
-    workspace = launcher_root()
+def _expand_command_template(template: list[str], directory: Path, run_dir: Path) -> list[str]:
+    """Expand the site command placeholders; no shell-level string concatenation."""
+    return [
+        item.replace("{stage_dir}", str(directory)).replace("{run_dir}", str(run_dir))
+        for item in template
+    ]
+
+
+def _commands(
+    config: dict[str, Any],
+    directory: Path,
+    *,
+    mpi_processes: int | None = None,
+    run_dir: Path | None = None,
+) -> list[list[str]]:
+    """Resolve Wannier attempt commands exclusively from the explicit site config.
+
+    ``preprocess_inputs.commands.04_wannier`` is the VASP launcher (same contract
+    as SCF/Band) and ``04_wannier90`` is the Wannier90 launcher whose final
+    logical seed is fixed to ``wannier90``; the running mode (``pre``/``run``) is
+    appended by this function.  A missing field is a configuration error and is
+    never silently resolved from ``W90FLOW_LAUNCHER_ROOT`` or the home directory.
+    """
+    root = Path(run_dir).expanduser() if run_dir is not None else directory.parents[4]
+    inputs = config.get("preprocess_inputs", {})
+    commands = inputs.get("commands")
+    if not isinstance(commands, dict):
+        raise ValueError(
+            "Stage-1 配置缺少 preprocess_inputs.commands（Wannier 需要 04_wannier 与 04_wannier90）。"
+        )
     backend = config.get("backend", {})
     default_kind = "ncl" if config.get("physics", {}).get("soc") else "std"
-    commands = [
-        [
-            str(workspace / "00_命令入口/计算/运行VASP.command"),
-            str(directory),
-            str(backend.get("vasp", default_kind)),
-            str(mpi_processes if mpi_processes is not None else backend.get("mpi_processes", 2)),
-        ],
-    ]
+    kind = str(backend.get("vasp", default_kind))
+    mpi = str(mpi_processes if mpi_processes is not None else backend.get("mpi_processes", 2))
+
+    vasp_template = commands.get("04_wannier")
+    if (
+        not isinstance(vasp_template, list)
+        or len(vasp_template) < 3
+        or any(not isinstance(item, str) for item in vasp_template)
+    ):
+        raise ValueError(
+            "preprocess_inputs.commands.04_wannier 必须是参数列表，末两项依次为 std/ncl 与 MPI 数。"
+        )
+    if vasp_template[-2].strip().lower() != kind:
+        raise ValueError(
+            f"preprocess_inputs.commands.04_wannier 应使用 {kind}；当前为 {vasp_template[-2]}。"
+        )
+    if str(vasp_template[-1]) != mpi:
+        raise ValueError(
+            f"preprocess_inputs.commands.04_wannier MPI 数 {vasp_template[-1]} "
+            f"与 backend.mpi_processes={mpi} 不一致。"
+        )
+    vasp_command = _expand_command_template(vasp_template, directory, root)
+
+    w90_template = commands.get("04_wannier90")
+    if (
+        not isinstance(w90_template, list)
+        or len(w90_template) < 3
+        or any(not isinstance(item, str) for item in w90_template)
+    ):
+        raise ValueError(
+            "preprocess_inputs.commands.04_wannier90 必须是至少 3 项参数列表，末项固定为 wannier90。"
+        )
+    if w90_template[-1] != "wannier90":
+        raise ValueError(
+            "preprocess_inputs.commands.04_wannier90 末项必须是固定逻辑 seed wannier90；"
+            f"当前为 {w90_template[-1]!r}。"
+        )
+    w90_base = _expand_command_template(w90_template, directory, root)
+
+    result: list[list[str]] = [vasp_command]
     if backend.get("wannier_input_mode", "embedded") == "standalone_win":
-        commands.append([
-            str(workspace / "00_命令入口/计算/运行Wannier90.command"),
-            str(directory),
-            "wannier90",
-            "pre",
-        ])
-    commands.append([
-            str(workspace / "00_命令入口/计算/运行Wannier90.command"),
-            str(directory),
-            "wannier90",
-            "run",
-        ])
-    return commands
+        result.append(w90_base + ["pre"])
+    result.append(w90_base + ["run"])
+    return result
 
 
 def run_attempt(
@@ -1020,7 +1069,7 @@ def run_attempt(
     missing = [str(path) for path in required if not path.is_file()]
     if mpi_processes is not None and mpi_processes <= 0:
         raise ValueError("mpi_processes 必须是正整数。")
-    commands = _commands(config, directory, mpi_processes=mpi_processes)
+    commands = _commands(config, directory, mpi_processes=mpi_processes, run_dir=root)
     if not execute:
         return {"mode": "DRY_RUN", "path": str(directory), "commands": commands, "missing_inputs": missing, "passed": not missing}
     if not config.get("execution", {}).get("allow_execute", False):

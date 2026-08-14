@@ -72,6 +72,10 @@ SNAPSHOT = """backend:
   mpi_processes: 2
 execution:
   allow_execute: true
+preprocess_inputs:
+  commands:
+    04_wannier: [/bin/echo, "{stage_dir}", std, "2"]
+    04_wannier90: [/bin/echo, "{stage_dir}", wannier90]
 """
 
 

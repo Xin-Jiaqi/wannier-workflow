@@ -96,6 +96,8 @@ def _fixture(root: Path, *, structure_id: str = "XY2") -> tuple[Path, Path, Path
             "commands": {
                 "02_scf": ["launcher", "{stage_dir}", "std", "2"],
                 "03_band": ["launcher", "{stage_dir}", "std", "2"],
+                "04_wannier": ["launcher", "{stage_dir}", "std", "2"],
+                "04_wannier90": ["launcher", "{stage_dir}", "wannier90"],
             },
         },
     }

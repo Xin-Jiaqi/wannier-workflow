@@ -102,6 +102,8 @@ MAGMOM = 9*0
                 "commands": {
                     "02_scf": ["launcher", "{stage_dir}", "ncl", "4"],
                     "03_band": ["launcher", "{stage_dir}", "ncl", "4"],
+                    "04_wannier": ["launcher", "{stage_dir}", "ncl", "4"],
+                    "04_wannier90": ["launcher", "{stage_dir}", "wannier90"],
                 },
             },
         }

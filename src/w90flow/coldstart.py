@@ -187,6 +187,45 @@ def _validate_execution_contract(
                 f"与 backend.mpi_processes={mpi_processes} 不一致。"
             )
         checked[stage] = {"vasp": command_vasp, "mpi_processes": command_mpi}
+
+    wannier_vasp = commands.get("04_wannier")
+    if (
+        not isinstance(wannier_vasp, list)
+        or len(wannier_vasp) < 3
+        or any(not isinstance(item, str) for item in wannier_vasp)
+    ):
+        raise ValueError(
+            "preprocess_inputs.commands.04_wannier 必须是参数列表，末两项依次为 std/ncl 与 MPI 数。"
+        )
+    wannier_vasp_kind = wannier_vasp[-2].strip().lower()
+    if wannier_vasp_kind != expected_backend:
+        raise ValueError(
+            f"preprocess_inputs.commands.04_wannier 应使用 {expected_backend}；当前为 {wannier_vasp_kind}。"
+        )
+    wannier_mpi = _positive_mpi_processes(
+        wannier_vasp[-1], "preprocess_inputs.commands.04_wannier MPI 数"
+    )
+    if wannier_mpi != mpi_processes:
+        raise ValueError(
+            f"preprocess_inputs.commands.04_wannier MPI 数 {wannier_mpi} "
+            f"与 backend.mpi_processes={mpi_processes} 不一致。"
+        )
+    wannier90 = commands.get("04_wannier90")
+    if (
+        not isinstance(wannier90, list)
+        or len(wannier90) < 3
+        or any(not isinstance(item, str) for item in wannier90)
+    ):
+        raise ValueError(
+            "preprocess_inputs.commands.04_wannier90 必须是至少 3 项参数列表，末项固定为 wannier90。"
+        )
+    if wannier90[-1] != "wannier90":
+        raise ValueError(
+            "preprocess_inputs.commands.04_wannier90 末项必须是固定逻辑 seed wannier90；"
+            f"当前为 {wannier90[-1]!r}。"
+        )
+    checked["04_wannier"] = {"vasp": wannier_vasp_kind, "mpi_processes": wannier_mpi}
+    checked["04_wannier90"] = {"seed": wannier90[-1]}
     return {
         "physics_soc": requested_soc,
         "backend_vasp": backend_vasp,
