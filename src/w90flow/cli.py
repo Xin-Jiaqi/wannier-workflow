@@ -18,6 +18,7 @@ from .quality import evaluate_attempt, evaluate_run, export_ranked_attempts, ran
 from .ranking import audit_ranking_document
 from .material_pool import screen_c2db, write_material_pool
 from .orchestrator import WORKFLOW_STOPS, fit_from_precomputed, fit_from_preprocess, inspect_workflow, run_workflow
+from .run_material import run_material
 from .state import initialize_run, read_status, sha256_file
 from .preprocess import (
     PREPROCESS_STAGES,
@@ -161,6 +162,27 @@ def build_parser() -> argparse.ArgumentParser:
     coldstart.add_argument("--runs-root", default=None)
     coldstart.add_argument("--poll-seconds", type=float, default=30.0)
     coldstart.add_argument("--execute", action="store_true")
+
+    run_material_parser = sub.add_parser(
+        "run-material",
+        help="单材料生产入口：POSCAR→SCF→Band→候选→Wannier→质量→排名→导出；"
+             "统一终态 TOP3_READY/PARTIAL_TOPK/NO_MODEL/TECHNICAL_FAILED",
+    )
+    run_material_parser.add_argument("poscar", help="结构优化好的 POSCAR")
+    run_material_parser.add_argument("material_id", help="材料 ID（必须等于配置 structure id）")
+    run_material_parser.add_argument("--config", required=True, help="单结构 Stage-1 profile 配置")
+    run_material_parser.add_argument("--work-root", required=True, help="runs/campaigns 根目录")
+    run_material_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只读：输出 stage plan、输入指纹与复用条件；不创建状态、不提交计算",
+    )
+    run_material_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="继续已有非终态 campaign（成功 stage 不重跑，遵循现有 retry 语义）",
+    )
+    run_material_parser.add_argument("--poll-seconds", type=float, default=30.0)
 
     inspect = sub.add_parser("inspect", help="只读显示自动状态机的下一动作")
     inspect.add_argument("run_dir")
@@ -394,6 +416,27 @@ def main(argv: list[str] | None = None) -> int:
             )
             _emit(result)
             return 0 if (not args.execute or result.get("status") == "COMPLETE") else 1
+        elif args.command == "run-material":
+            try:
+                result = run_material(
+                    args.poscar,
+                    args.material_id,
+                    args.config,
+                    args.work_root,
+                    dry_run=args.dry_run,
+                    resume=args.resume,
+                    poll_seconds=args.poll_seconds,
+                )
+            except (ValueError, RuntimeError) as exc:
+                _emit({
+                    "mode": "ERROR",
+                    "error_type": type(exc).__name__,
+                    "reason": str(exc),
+                    "exit_code": 1,
+                })
+                return 1
+            _emit(result)
+            return int(result["exit_code"])
         elif args.command == "audit-ranking":
             with Path(args.ranking_json).open("r", encoding="utf-8") as handle:
                 result = audit_ranking_document(json.load(handle))

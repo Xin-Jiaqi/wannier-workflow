@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "purpose": "expected terminal taxonomy for the single-material production entry (run-material)",
+  "source_of_truth": "wannier-workflow docs and materials-structure-benchmark catalog IDs (structure provenance only; no second state truth)",
+  "cases": [
+    {
+      "material_id": "LiAuI4",
+      "formula": "LiAuI4",
+      "expected_terminal": "TOP3_READY",
+      "class": "full-success",
+      "rationale": "positive control: >=3 accepted candidates, export Top-3",
+      "source_ref": "materials-structure-benchmark catalog mst-bulk-cod-000010 (reduced formula LiAuI4)"
+    },
+    {
+      "material_id": "PdS2",
+      "formula": "PdS2",
+      "expected_terminal": "PARTIAL_TOPK",
+      "class": "partial",
+      "rationale": "1-2 accepted after candidate exhaustion; must not be padded to 3",
+      "source_ref": "materials-structure-benchmark catalog mst-bulk-cod-000025 (reduced formula PdS2)"
+    },
+    {
+      "material_id": "SSn",
+      "formula": "SSn",
+      "expected_terminal": "NO_MODEL",
+      "class": "no-model-quality-reject",
+      "rationale": "quality rejection / no model after exhaustion; compact candidates rejected (SSn needs 26-WF all-relevant)",
+      "source_ref": "wannier-workflow REFERENCE_REGRESSION_MATRIX.md"
+    },
+    {
+      "material_id": "SiS2",
+      "formula": "SiS2",
+      "expected_terminal": "NO_MODEL",
+      "class": "no-model-quality-reject",
+      "rationale": "quality rejection expected; no padded model",
+      "source_ref": "wannier-workflow GENERALIZATION_PROTOCOL.md blind-test set"
+    },
+    {
+      "material_id": "ZrI2",
+      "formula": "ZrI2",
+      "expected_terminal": "TECHNICAL_FAILED",
+      "class": "technical-to-scientific-difficult",
+      "rationale": "starts as infrastructure/program failure; after diagnosis may become NO_MODEL or PARTIAL_TOPK; must never be reported as success",
+      "source_ref": "materials-structure-benchmark catalog index by-formula ZrI2; local zrI2-fix patch history"
+    }
+  ]
+}

@@ -347,6 +347,40 @@ def plan_stage1_coldstart(config_path: str | Path, campaign_dir: str | Path, run
     }
 
 
+def coldstart_signature(config_file: str | Path, plan: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Canonical input signature shared by coldstart and the run-material entry."""
+    signature = {
+        "config": str(Path(config_file).expanduser().resolve()),
+        "config_sha256": sha256_file(config_file),
+        "structures": {item["id"]: item["poscar_sha256"] for item in plan["structures"]},
+        "immutable_input_sha256": plan["immutable_input_sha256"],
+    }
+    signature_sha256 = hashlib.sha256(
+        json.dumps(signature, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return signature, signature_sha256
+
+
+def derived_preprocess_run(
+    runs_root: str | Path,
+    project: str,
+    structure_id: str,
+    poscar_sha256: str,
+    signature_sha256: str,
+) -> Path:
+    """Deterministic preprocess run path for one structure (single source of truth)."""
+    return (
+        Path(runs_root).expanduser().resolve()
+        / "preprocess"
+        / f"{project}-{structure_id}-{signature_sha256[:8]}-{poscar_sha256[:8]}"
+    )
+
+
+def derived_wannier_run(runs_root: str | Path, project: str, signature_sha256: str) -> Path:
+    """Deterministic Wannier run path for one coldstart campaign (single source of truth)."""
+    return Path(runs_root).expanduser().resolve() / f"{project}-coldstart-{signature_sha256[:16]}"
+
+
 def _save(path: Path, state: dict[str, Any], status: str, **extra: Any) -> dict[str, Any]:
     state.update({"schema_version": 1, "updated_utc": _utc_now(), "status": status, **extra})
     atomic_json(path, state)
@@ -417,15 +451,7 @@ def run_stage1_coldstart(
     campaign.mkdir(parents=True, exist_ok=True)
     state_path = campaign / STATE_FILE
     config = load_project(config_file)
-    signature = {
-        "config": str(config_file),
-        "config_sha256": sha256_file(config_file),
-        "structures": {item["id"]: item["poscar_sha256"] for item in plan["structures"]},
-        "immutable_input_sha256": plan["immutable_input_sha256"],
-    }
-    signature_sha256 = hashlib.sha256(
-        json.dumps(signature, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    signature, signature_sha256 = coldstart_signature(config_file, plan)
 
     with ColdStartLock(campaign):
         if state_path.is_file():
@@ -435,8 +461,13 @@ def run_stage1_coldstart(
         else:
             preprocess_runs = {
                 item["id"]: str(
-                    runs / "preprocess" /
-                    f"{config['project']}-{item['id']}-{signature_sha256[:8]}-{item['poscar_sha256'][:8]}"
+                    derived_preprocess_run(
+                        runs,
+                        config["project"],
+                        item["id"],
+                        item["poscar_sha256"],
+                        signature_sha256,
+                    )
                 )
                 for item in plan["structures"]
             }
@@ -491,10 +522,7 @@ def run_stage1_coldstart(
                     f"记录的 Wannier run 未完成不可变导入；拒绝创建重复 run：{wannier_run}"
                 )
         else:
-            wannier_run = runs / (
-                f"{config['project']}-coldstart-"
-                f"{signature_sha256[:16]}"
-            )
+            wannier_run = derived_wannier_run(runs, config["project"], signature_sha256)
             state["wannier_run"] = str(wannier_run)
             _save(state_path, state, "WANNIER_BOOTSTRAPPING", preprocess_sources=sources)
             bootstrapped = fit_from_preprocess(
