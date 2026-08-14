@@ -308,12 +308,14 @@ class CandidatesReuseTests(unittest.TestCase):
 
     def _prior_wannier_legacy(self, work: Path, plan: dict, *, spec_overrides: dict | None = None,
                               with_scf_evidence: bool = True, with_band_evidence: bool = True,
-                              scf_source: str | None = None, band_source: str | None = None) -> Path:
+                              scf_source: str | None = None, band_source: str | None = None,
+                              stage_names: tuple[str, str] = ("02_scf", "03_band")) -> Path:
         prior_pre = _prior_preprocess(work, plan)
         prior = work / "runs" / "prior-coldstart-legacy-0001"
         sid = str(plan["structures"][0]["id"])
+        scf_stage, band_stage = stage_names
         if with_scf_evidence:
-            scf_dir = prior / "02_scf"
+            scf_dir = prior / scf_stage
             scf_dir.mkdir(parents=True)
             (scf_dir / "import-manifest.json").write_text(json.dumps({
                 "schema_version": 1,
@@ -322,7 +324,7 @@ class CandidatesReuseTests(unittest.TestCase):
             }), encoding="utf-8")
             (scf_dir / "stage.json").write_text(json.dumps({"status": "PASS"}), encoding="utf-8")
         if with_band_evidence:
-            band_dir = prior / "03_band"
+            band_dir = prior / band_stage
             band_dir.mkdir(parents=True)
             (band_dir / "import-manifest.json").write_text(json.dumps({
                 "schema_version": 1,
@@ -376,6 +378,19 @@ class CandidatesReuseTests(unittest.TestCase):
             self.assertEqual(reuse["stages"]["candidates"]["preprocess_parents"]["XY2"], parent)
             self.assertNotIn("04_wannier", reuse["stages"])
 
+    def test_legacy_coldstart_real_layout_01scf_02band_resolves(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config, poscar, work = _fixture(Path(temporary))
+            plan = _plan(config, work)
+            prior = self._prior_wannier_legacy(work, plan, stage_names=("01_scf", "02_band"))
+            reuse = coldstart.verify_reuse_source(prior, config, plan)
+            self.assertEqual(reuse["source_layout_version"], "legacy")
+            parent = str((work / "runs/preprocess/prior-run-0001").resolve())
+            self.assertEqual(reuse["preprocess_sources"]["XY2"], parent)
+            self.assertEqual(reuse["stages"]["scf"]["XY2"]["source_stage"], "01_scf")
+            self.assertEqual(reuse["stages"]["band"]["XY2"]["source_stage"], "02_band")
+            self.assertNotIn("04_wannier", reuse["stages"])
+
     def test_legacy_coldstart_without_parent_evidence_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config, poscar, work = _fixture(Path(temporary))
@@ -390,7 +405,7 @@ class CandidatesReuseTests(unittest.TestCase):
             config, poscar, work = _fixture(Path(temporary))
             plan = _plan(config, work)
             prior = self._prior_wannier_legacy(work, plan, with_band_evidence=False)
-            with self.assertRaisesRegex(ValueError, "03_band/import-manifest.json"):
+            with self.assertRaisesRegex(ValueError, "import-manifest"):
                 coldstart.verify_reuse_source(prior, config, plan)
 
     def test_legacy_coldstart_scf_band_parent_mismatch_rejected(self) -> None:

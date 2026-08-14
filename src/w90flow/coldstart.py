@@ -605,38 +605,49 @@ def _verify_candidates_reuse_source(
 def _resolve_legacy_preprocess_sources(
     prior: Path,
     structure_ids: list[str],
-) -> dict[str, str]:
-    """Resolve preprocess parents from dfb26b5-era root-level import manifests.
+) -> tuple[dict[str, str], tuple[str, str]]:
+    """Resolve preprocess parents from legacy root-level import manifests.
 
-    Legacy Stage1 Wannier runs recorded explicit parent references in
-    ``02_scf/import-manifest.json`` and ``03_band/import-manifest.json`` at the
-    run root (``results[].source`` points into the preprocess run).  Directory
-    paths are never guessed: when either manifest or a per-structure record is
-    missing, the caller must pass the preprocess run directly as
-    ``--reuse-from``.
+    Stage1 Wannier runs recorded explicit parent references in
+    ``01_scf/import-manifest.json`` and ``02_band/import-manifest.json`` at the
+    run root (``results[].source`` points into the preprocess run).  Some
+    fixtures/layouts use ``02_scf``/``03_band`` for the same pair, so both
+    stage-name pairs are probed; the first pair with complete manifests wins.
+    Directory paths are never guessed: when neither pair has complete evidence,
+    the caller must pass the preprocess run directly as ``--reuse-from``.
     """
-    manifests: dict[str, dict[str, dict[str, Any]]] = {}
-    for stage in ("02_scf", "03_band"):
-        manifest_path = prior / stage / "import-manifest.json"
-        if not manifest_path.is_file():
-            raise ValueError(
-                f"候选源无法解析 SCF parent run：旧版 {stage}/import-manifest.json 不存在"
-                "（新版 structures/<sid>/02_scf/import-manifest.json 也不存在）；"
-                "拒绝猜测目录，请直接传 preprocess run 作为 --reuse-from"
-            )
-        document = read_json(manifest_path)
-        results = document.get("results") if isinstance(document, dict) else None
-        if not isinstance(results, list) or not results:
-            raise ValueError(f"候选源 {stage}/import-manifest.json 无 results 记录，拒绝解析 parent")
-        by_structure: dict[str, dict[str, Any]] = {}
-        for record in results:
-            if isinstance(record, dict) and isinstance(record.get("structure"), str):
-                by_structure[str(record["structure"])] = record
-        manifests[stage] = by_structure
+    stage_pairs = (("01_scf", "02_band"), ("02_scf", "03_band"))
+    manifests: dict[str, dict[str, dict[str, Any]]] | None = None
+    used_pairs: tuple[str, str] | None = None
+    for scf_stage, band_stage in stage_pairs:
+        scf_manifest = prior / scf_stage / "import-manifest.json"
+        band_manifest = prior / band_stage / "import-manifest.json"
+        if not scf_manifest.is_file() or not band_manifest.is_file():
+            continue
+        parsed: dict[str, dict[str, dict[str, Any]]] = {}
+        for stage, manifest_path in ((scf_stage, scf_manifest), (band_stage, band_manifest)):
+            document = read_json(manifest_path)
+            results = document.get("results") if isinstance(document, dict) else None
+            if not isinstance(results, list) or not results:
+                raise ValueError(f"候选源 {stage}/import-manifest.json 无 results 记录，拒绝解析 parent")
+            by_structure: dict[str, dict[str, Any]] = {}
+            for record in results:
+                if isinstance(record, dict) and isinstance(record.get("structure"), str):
+                    by_structure[str(record["structure"])] = record
+            parsed[stage] = by_structure
+        manifests = parsed
+        used_pairs = (scf_stage, band_stage)
+        break
+    if manifests is None or used_pairs is None:
+        raise ValueError(
+            "候选源无法解析 SCF parent run：run 根级既无 "
+            "01_scf/02_band 也无 02_scf/03_band 的完整 import-manifest；"
+            "拒绝猜测目录，请直接传 preprocess run 作为 --reuse-from"
+        )
     parents: dict[str, str] = {}
     for sid in structure_ids:
-        scf_record = manifests["02_scf"].get(sid)
-        band_record = manifests["03_band"].get(sid)
+        scf_record = manifests[used_pairs[0]].get(sid)
+        band_record = manifests[used_pairs[1]].get(sid)
         if not scf_record or not band_record:
             raise ValueError(
                 f"候选源（旧版布局）缺少 {sid} 的 SCF/Band parent 记录，拒绝猜测目录；"
@@ -653,7 +664,7 @@ def _resolve_legacy_preprocess_sources(
         if not scf_parent.is_dir():
             raise ValueError(f"候选源（旧版布局）{sid} 的 SCF parent 不存在：{scf_parent}")
         parents[sid] = str(scf_parent)
-    return parents
+    return parents, used_pairs
 
 
 def verify_reuse_source(
@@ -676,6 +687,7 @@ def verify_reuse_source(
         preprocess_sources = {str(item["id"]): str(prior) for item in plan["structures"]}
         candidates_info = None
         layout_version = "preprocess"
+        scf_stage_label, band_stage_label = "02_scf", "03_band"
     elif (prior / "03_candidates/stage.json").is_file():
         structure_ids = [str(item["id"]) for item in plan["structures"]]
         per_structure_manifests = [
@@ -696,8 +708,11 @@ def verify_reuse_source(
                     raise ValueError(f"SCF parent run 不存在：{parent}")
                 preprocess_sources[sid] = str(parent)
             layout_version = "current"
+            scf_stage_label, band_stage_label = "02_scf", "03_band"
         elif not any(present):
-            preprocess_sources = _resolve_legacy_preprocess_sources(prior, structure_ids)
+            preprocess_sources, (scf_stage_label, band_stage_label) = _resolve_legacy_preprocess_sources(
+                prior, structure_ids
+            )
             layout_version = "legacy"
         else:
             raise ValueError(
@@ -721,14 +736,14 @@ def verify_reuse_source(
     for sid, verified in preprocess_verified.items():
         stages.setdefault("scf", {})[sid] = {
             "source_run": preprocess_sources[sid],
-            "source_stage": "02_scf",
+            "source_stage": scf_stage_label,
             "stage_status": "PASS",
             "source_layout_version": layout_version,
             "hashes": verified["hashes"],
         }
         stages.setdefault("band", {})[sid] = {
             "source_run": preprocess_sources[sid],
-            "source_stage": "03_band",
+            "source_stage": band_stage_label,
             "stage_status": "PASS",
             "source_layout_version": layout_version,
             "hashes": verified["hashes"],
