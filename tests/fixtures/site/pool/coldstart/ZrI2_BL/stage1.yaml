@@ -11,5 +11,10 @@ backend:
   vasp: ncl
   mpi_processes: 32
   wannier_input_mode: standalone_win
+  spinor_wannier_interface:
+    vasp_launcher: /site/bin/run-vasp
+    vasp_version: '6.4.3'
+    wannier90_launcher: /site/bin/run-wannier90
+    wannier90_version: '3.1.0'
 ranking:
   output_top_k: 3

@@ -59,7 +59,7 @@ class MaterialAuthTests(unittest.TestCase):
             self.assertEqual(report["active_jobs"], [])
 
     def test_any_manifest_material_passes_without_special_cases(self) -> None:
-        for material_id in ("LiAuI4_BL", "PdS2_BL", "ZrI2_BL", "X2Y_BL"):
+        for material_id in ("LiAuI4_BL", "CuI_BL", "PdS2_BL", "ZrI2_BL", "X2Y_BL"):
             with self.subTest(material=material_id):
                 with tempfile.TemporaryDirectory() as temporary:
                     report = self._preflight(material_id, Path(temporary))
