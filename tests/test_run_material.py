@@ -240,6 +240,39 @@ class RunMaterialTerminalTests(unittest.TestCase):
             self.assertEqual(outcome["accepted_count"], 0)
             self.assertEqual(outcome["exit_code"], 0)
 
+    def test_interface_failure_is_technical_not_no_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config, poscar, work = _fixture(Path(temporary))
+            plan = rm.material_plan(poscar, "XY2", config, work)
+            wannier = _wannier_run(plan, work)
+            _stage(wannier, "04_wannier", "FAIL", failure_class="INTERFACE_FAILURE")
+            with mock.patch(
+                "w90flow.run_material.run_stage1_coldstart",
+                return_value={"status": "BLOCKED", "wannier_run": str(wannier)},
+            ):
+                outcome = rm.run_material(poscar, "XY2", config, work, resume=True)
+            self.assertEqual(outcome["status"], "TECHNICAL_FAILED")
+            self.assertEqual(outcome["failure_class"], "INFRASTRUCTURE_OR_PROGRAM")
+            self.assertEqual(outcome["accepted_count"], 0)
+            self.assertEqual(outcome["exit_code"], 2)
+
+    def test_numeric_failure_block_is_technical_not_exhaustion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config, poscar, work = _fixture(Path(temporary))
+            plan = rm.material_plan(poscar, "XY2", config, work)
+            wannier = _wannier_run(plan, work)
+            wannier.mkdir(parents=True, exist_ok=True)
+            (wannier / "workflow-summary.json").write_text(json.dumps({
+                "reason": "LiAuI4_BL/pyw90-dos/attempt-001 数值失败。",
+            }), encoding="utf-8")
+            with mock.patch(
+                "w90flow.run_material.run_stage1_coldstart",
+                return_value={"status": "BLOCKED", "wannier_run": str(wannier)},
+            ):
+                outcome = rm.run_material(poscar, "XY2", config, work, resume=True)
+            self.assertEqual(outcome["status"], "TECHNICAL_FAILED")
+            self.assertEqual(outcome["exit_code"], 2)
+
     def test_technical_failed_on_infrastructure_block(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config, poscar, work = _fixture(Path(temporary))

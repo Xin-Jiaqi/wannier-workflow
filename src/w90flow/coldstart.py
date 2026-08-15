@@ -227,6 +227,15 @@ def _validate_execution_contract(
         )
     checked["04_wannier"] = {"vasp": wannier_vasp_kind, "mpi_processes": wannier_mpi}
     checked["04_wannier90"] = {"seed": wannier90[-1]}
+
+    from .doctor import capability_errors
+
+    capability_problems = capability_errors(config, commands)
+    if capability_problems:
+        raise ValueError(
+            "SOC/spinor Wannier 需要兼容 site capability（VASP>=6.4 + Wannier90>=3）："
+            + "；".join(capability_problems)
+        )
     return {
         "physics_soc": requested_soc,
         "backend_vasp": backend_vasp,

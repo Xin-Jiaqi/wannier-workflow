@@ -28,6 +28,7 @@ FAILURE_TRANSITIONS = {
     "QUALITY_GATE_FAILED": "protect_target_window_then_add_next_missing_orbital_shell",
     "INVALID_WINDOW_CONTAINMENT": "regenerate_attempt_with_frozen_window_inside_outer_window",
     "INFRASTRUCTURE_FAILURE": "retry_same_attempt_once_after_environment_check",
+    "INTERFACE_FAILURE": "stop_and_require_site_environment_fix",
     "KPOINT_INDEX_ORDER_MISMATCH": "rebuild_wannier_inputs_from_one_shared_explicit_mesh",
     "NUMERIC_FAILURE": "stop_and_require_manual_diagnosis",
 }
@@ -953,7 +954,19 @@ def classify_failure(directory: Path, returncode: int) -> str | None:
         return "LOCALIZATION_NOT_CONVERGED"
     if "kpoint_index_order_mismatch" in lower:
         return "KPOINT_INDEX_ORDER_MISMATCH"
-    if "nan" in lower or "segmentation fault" in lower or returncode != 0:
+    if (
+        "corrupted unsorted chunks" in lower
+        or "corrupted top size" in lower
+        or "double free or corruption" in lower
+        or "malloc(): corrupted" in lower
+        or "heap corruption" in lower
+        or "killed by signal" in lower
+        or "bad termination" in lower
+        or "signal: 6 (aborted)" in lower
+        or "signal: 11 (segmentation fault)" in lower
+    ):
+        return "INTERFACE_FAILURE"
+    if "nan" in lower or returncode != 0:
         return "NUMERIC_FAILURE"
     return None
 
@@ -1041,6 +1054,15 @@ def _commands(
             "preprocess_inputs.commands.04_wannier90 末项必须是固定逻辑 seed wannier90；"
             f"当前为 {w90_template[-1]!r}。"
         )
+    if config.get("physics", {}).get("soc"):
+        from .doctor import capability_errors
+
+        problems = capability_errors(config, commands)
+        if problems:
+            raise ValueError(
+                "SOC/spinor Wannier 需要兼容 site capability（VASP>=6.4 + Wannier90>=3）："
+                + "；".join(problems)
+            )
     w90_base = _expand_command_template(w90_template, directory, root)
 
     result: list[list[str]] = [vasp_command]

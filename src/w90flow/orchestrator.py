@@ -378,6 +378,11 @@ def choose_retry_reason(
 ) -> str | None:
     """Choose one finite deterministic branch; never relax quality thresholds."""
     clean = {failure for failure in failures if failure}
+    if "INTERFACE_FAILURE" in clean:
+        raise WorkflowBlocked(
+            "VASP/Wannier90 接口或工具链失败（全局技术故障）：需更换兼容的 site "
+            "VASP/Wannier90 组合；不自动放宽科学参数，不继续消耗候选。"
+        )
     if "NUMERIC_FAILURE" in clean:
         raise WorkflowBlocked("数值失败不能通过自动放宽科学参数处理。")
     if "INFRASTRUCTURE_FAILURE" in clean:
@@ -527,7 +532,13 @@ def _process_candidate(
                 and not list(record.get("execution_history", []))
             ):
                 result = run_attempt(root, sid, candidate, selected, execute=True, mpi_processes=mpi_processes)
-                if not result.get("passed") and result["attempt"].get("failure_class") == "NUMERIC_FAILURE":
+                failure_class = result["attempt"].get("failure_class") if not result.get("passed") else None
+                if failure_class == "INTERFACE_FAILURE":
+                    raise WorkflowBlocked(
+                        f"{sid}/{candidate}/{selected} 接口/工具链失败：VASP-Wannier90 "
+                        "不兼容或进程崩溃（.amn/.eig 未生成），需更换 site 组合；不继续消耗候选。"
+                    )
+                if failure_class == "NUMERIC_FAILURE":
                     raise WorkflowBlocked(f"{sid}/{candidate}/{selected} 数值失败。")
 
 

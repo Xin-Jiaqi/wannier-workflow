@@ -23,13 +23,21 @@ W90_WRAPPER = "/site/bin/run-wannier90"
 
 def _config(*, soc: bool = True, wannier_input_mode: str = "embedded") -> dict:
     kind = "ncl" if soc else "std"
+    backend = {
+        "vasp": kind,
+        "mpi_processes": 4,
+        "wannier_input_mode": wannier_input_mode,
+    }
+    if soc:
+        backend["spinor_wannier_interface"] = {
+            "vasp_launcher": VASP_WRAPPER,
+            "vasp_version": "6.4.3",
+            "wannier90_launcher": W90_WRAPPER,
+            "wannier90_version": "3.1.0",
+        }
     return {
         "physics": {"soc": soc, "dimensionality": 2},
-        "backend": {
-            "vasp": kind,
-            "mpi_processes": 4,
-            "wannier_input_mode": wannier_input_mode,
-        },
+        "backend": backend,
         "execution": {"allow_execute": True},
         "preprocess_inputs": {
             "commands": {
@@ -124,6 +132,47 @@ class AttemptsCommandResolutionTests(unittest.TestCase):
                 del cfg["preprocess_inputs"]["commands"]["04_wannier"]
                 with self.assertRaisesRegex(ValueError, "04_wannier"):
                     _commands(cfg, directory, run_dir=root)
+
+    def test_soc_wannier_commands_must_come_from_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            directory = self._attempt(root)
+            cfg = _config()
+            cfg["preprocess_inputs"]["commands"]["04_wannier"][0] = "/other/vasp.wrapper"
+            with self.assertRaisesRegex(ValueError, "spinor_wannier_interface"):
+                _commands(cfg, directory, run_dir=root)
+            cfg = _config()
+            cfg["preprocess_inputs"]["commands"]["04_wannier90"][0] = "/other/w90.wrapper"
+            with self.assertRaisesRegex(ValueError, "spinor_wannier_interface"):
+                _commands(cfg, directory, run_dir=root)
+
+    def test_soc_wannier_requires_capability_declaration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            directory = self._attempt(root)
+            cfg = _config()
+            del cfg["backend"]["spinor_wannier_interface"]
+            with self.assertRaisesRegex(ValueError, "spinor_wannier_interface"):
+                _commands(cfg, directory, run_dir=root)
+
+    def test_non_soc_commands_need_no_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            directory = self._attempt(root)
+            cfg = _config(soc=False)
+            chain = _commands(cfg, directory, run_dir=root)
+            self.assertEqual(chain[0], [VASP_WRAPPER, str(directory), "std", "4"])
+
+    def test_no_material_id_special_cases_in_capability_resolution(self) -> None:
+        import inspect
+
+        from w90flow import attempts, coldstart, doctor, orchestrator, run_material
+
+        banned = ("ZrI2_BL", "LiAuI4_BL", "PdS2_BL", "NbO2I_BL", "BiI3_BL")
+        for module in (attempts, coldstart, doctor, orchestrator, run_material):
+            source = inspect.getsource(module)
+            for token in banned:
+                self.assertNotIn(token, source, f"{module.__name__} 含材料特例 {token}")
 
 
 class ExecutorLauncherResolutionTests(unittest.TestCase):

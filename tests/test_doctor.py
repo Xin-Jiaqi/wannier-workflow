@@ -40,6 +40,9 @@ def _fixture(
     mac_command: str | None = None,
     potcar_ok: bool = True,
     include_commands: bool = True,
+    vasp_version: str = "6.4.3",
+    soc: bool = True,
+    include_capability: bool = True,
 ) -> Path:
     (root / "POSCAR").write_text(POSCAR, encoding="utf-8")
     templates = root / "templates"
@@ -66,7 +69,8 @@ def _fixture(
         },
     }), encoding="utf-8")
 
-    vasp_bin = root / "fake-vasp-ncl"
+    kind = "ncl" if soc else "std"
+    vasp_bin = root / (f"fake-vasp.{vasp_version}-ncl" if vasp_version else "fake-vasp-ncl")
     w90_bin = root / "fake-wannier90.x"
     vasp_bin.write_bytes(b"#!/bin/sh\necho vasp.5.4.4\n")
     w90_bin.write_bytes(b"#!/bin/sh\necho wannier90 3.1.0\n")
@@ -83,18 +87,18 @@ def _fixture(
 
     command_vasp = mac_command or str(run_vasp)
     commands = {
-        "02_scf": [command_vasp, "{stage_dir}", "ncl", "4"],
-        "03_band": [command_vasp, "{stage_dir}", "ncl", "4"],
-        "04_wannier": [command_vasp, "{stage_dir}", "ncl", "4"],
+        "02_scf": [command_vasp, "{stage_dir}", kind, "4"],
+        "03_band": [command_vasp, "{stage_dir}", kind, "4"],
+        "04_wannier": [command_vasp, "{stage_dir}", kind, "4"],
         "04_wannier90": [str(run_w90), "{stage_dir}", "wannier90"],
     }
     document = {
         "schema_version": 1,
         "project": "synthetic_doctor",
         "structures": [{"id": "XY2", "poscar": "POSCAR"}],
-        "physics": {"soc": True, "dimensionality": 2},
+        "physics": {"soc": soc, "dimensionality": 2},
         "pseudopotentials": {"lock": "POTCAR_LOCK.json", "set": "XY_PBE"},
-        "backend": {"kind": "local_mpi", "vasp": "ncl", "mpi_processes": 4},
+        "backend": {"kind": "local_mpi", "vasp": kind, "mpi_processes": 4},
         "preprocess_inputs": {
             "templates": {
                 stage: {"incar": f"templates/INCAR.{stage}", "kpoints": f"templates/KPOINTS.{stage}"}
@@ -109,6 +113,13 @@ def _fixture(
             },
         },
     }
+    if include_capability:
+        document["backend"]["spinor_wannier_interface"] = {
+            "vasp_launcher": str(run_vasp),
+            "vasp_version": vasp_version or "6.4.3",
+            "wannier90_launcher": str(run_w90),
+            "wannier90_version": "3.1.0",
+        }
     if include_commands:
         document["preprocess_inputs"]["commands"] = commands
     if not potcar_ok:
@@ -153,8 +164,50 @@ class DoctorEnvironmentTests(unittest.TestCase):
             self.assertEqual(_status(report, "wrap.02_scf"), "PASS")
             self.assertEqual(_status_prefix(report, "target.VASP."), "PASS")
             self.assertEqual(_status_prefix(report, "target.W90."), "PASS")
+            self.assertEqual(_status(report, "interface.vasp_wannier"), "PASS")
             self.assertEqual(_status(report, "potcar.lock"), "PASS")
             self.assertEqual(_status(report, "pbs"), "PASS")
+
+    def test_soc_wannier_rejects_vasp544_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _fixture(Path(temporary), vasp_version="5.4.4")
+            report = self._run(config, temporary, platform="linux")
+            self.assertEqual(_status(report, "interface.vasp_wannier"), "FAIL")
+            self.assertIn("5.4.4", [i["detail"] for i in report["items"] if i["id"] == "interface.vasp_wannier"][0])
+            self.assertEqual(report["overall"], "FAIL")
+
+    def test_soc_wannier_requires_capability_declaration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _fixture(Path(temporary), include_capability=False)
+            report = self._run(config, temporary, platform="linux")
+            self.assertEqual(_status(report, "interface.vasp_wannier"), "FAIL")
+            self.assertEqual(report["overall"], "FAIL")
+
+    def test_soc_wannier_rejects_wrapper_not_from_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = _fixture(root)
+            document = yaml.safe_load(config.read_text(encoding="utf-8"))
+            document["preprocess_inputs"]["commands"]["04_wannier"][0] = str(root / "other-vasp-wrapper")
+            config.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+            report = self._run(config, temporary, platform="linux")
+            self.assertEqual(_status(report, "interface.vasp_wannier"), "FAIL")
+            self.assertIn("04_wannier", [i["detail"] for i in report["items"] if i["id"] == "interface.vasp_wannier"][0])
+
+    def test_soc_wannier_rejects_wrapper_without_declared_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _fixture(Path(temporary), vasp_version="")
+            report = self._run(config, temporary, platform="linux")
+            self.assertEqual(_status(report, "interface.vasp_wannier"), "FAIL")
+            self.assertIn("未静态声明", [i["detail"] for i in report["items"] if i["id"] == "interface.vasp_wannier"][0])
+
+    def test_non_soc_allows_vasp544_profile_without_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _fixture(Path(temporary), soc=False, vasp_version="5.4.4", include_capability=False)
+            report = self._run(config, temporary, platform="linux")
+            self.assertNotIn("interface.vasp_wannier", _items(report))
+            self.assertEqual(_status(report, "wrap.04_wannier"), "PASS")
+            self.assertEqual(_status(report, "cmd.04_wannier"), "PASS")
 
     def test_missing_pyyaml_is_fail(self) -> None:
         def probe(name: str) -> tuple[str, str]:

@@ -602,6 +602,26 @@ end kpoint_path
             )
             self.assertEqual(classify_failure(path, 213), "INFRASTRUCTURE_FAILURE")
 
+    def test_wannier_interface_heap_corruption_is_interface_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "runner.log").write_text(
+                "Projection 72 done.\n"
+                "free(): corrupted unsorted chunks\n"
+                "BAD TERMINATION OF ONE OF YOUR APPLICATION PROCESSES\n"
+                "KILLED BY SIGNAL: 9 (Killed)\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(classify_failure(path, 255), "INTERFACE_FAILURE")
+
+    def test_interface_failure_is_not_numeric(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "runner.log").write_text(
+                "Signal: 6 (Aborted)\nBAD TERMINATION\n", encoding="utf-8"
+            )
+            self.assertEqual(classify_failure(path, 134), "INTERFACE_FAILURE")
+
     def test_explicit_orphan_diagnosis_overrides_truncated_log(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary)
@@ -893,6 +913,8 @@ class WorkflowTests(unittest.TestCase):
         )
         with self.assertRaises(WorkflowBlocked):
             choose_retry_reason(["NUMERIC_FAILURE"], set())
+        with self.assertRaises(WorkflowBlocked):
+            choose_retry_reason(["INTERFACE_FAILURE"], set())
         self.assertEqual(
             choose_retry_reason(
                 ["LOCALIZATION_NOT_CONVERGED"],

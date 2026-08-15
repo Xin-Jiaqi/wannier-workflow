@@ -39,6 +39,88 @@ W90_VERSION_RE = re.compile(r"wannier90[._ /-]*[0-9]+(?:\.[0-9]+)+", re.IGNORECA
 
 ImportProbe = Callable[[str], tuple[str, str]]
 
+# SOC/spinor + VASP-Wannier90 interface capability contract.  VASP < 6.4 has a
+# known-broken noncollinear Wannier90 interface (spinor projections crash with
+# heap corruption after writing wannier90.mmn, so .amn/.eig are never produced).
+SPINOR_WANNIER_CAPABILITY = "spinor_wannier_interface"
+SPINOR_WANNIER_MIN_VASP = (6, 4)
+SPINOR_WANNIER_MIN_W90 = (3, 0)
+
+
+def parse_version(value: Any) -> tuple[int, ...] | None:
+    """Parse a version declaration such as ``6.4.3`` into an integer tuple."""
+    if not isinstance(value, str):
+        return None
+    parts = tuple(int(part) for part in re.findall(r"\d+", value))
+    return parts or None
+
+
+def capability_errors(config: dict[str, Any], commands: dict[str, Any] | None = None) -> list[str]:
+    """Capability-contract violations for SOC/spinor Wannier runs.
+
+    Non-spinor runs are free to follow the profile's default VASP selection
+    (e.g. VASP 5.4.4).  Spinor Wannier runs must declare an explicit compatible
+    site capability and the Wannier-stage launchers must come from it: no
+    ``ncl``-default wrapper guessing and no material-id special cases.
+    """
+    physics = config.get("physics") or {}
+    if not physics.get("soc"):
+        return []
+    backend = config.get("backend") or {}
+    capability = backend.get(SPINOR_WANNIER_CAPABILITY)
+    if not isinstance(capability, dict):
+        return [
+            f"backend.{SPINOR_WANNIER_CAPABILITY} 缺失：SOC/spinor Wannier 需要显式声明 "
+            "VASP>=6.4 + Wannier90>=3 兼容 site 能力"
+        ]
+    problems: list[str] = []
+    launcher = capability.get("vasp_launcher")
+    if not isinstance(launcher, str) or not launcher:
+        problems.append(f"backend.{SPINOR_WANNIER_CAPABILITY}.vasp_launcher 缺失")
+    version = parse_version(capability.get("vasp_version"))
+    if version is None:
+        problems.append(f"backend.{SPINOR_WANNIER_CAPABILITY}.vasp_version 缺失/无法解析")
+    elif version < SPINOR_WANNIER_MIN_VASP:
+        problems.append(
+            f"backend.{SPINOR_WANNIER_CAPABILITY}.vasp_version="
+            f"{'.'.join(map(str, version))} < 6.4：VASP5.x NCL Wannier90 接口已知崩溃"
+        )
+    w90_launcher = capability.get("wannier90_launcher")
+    if not isinstance(w90_launcher, str) or not w90_launcher:
+        problems.append(f"backend.{SPINOR_WANNIER_CAPABILITY}.wannier90_launcher 缺失")
+    w90_version = parse_version(capability.get("wannier90_version"))
+    if w90_version is not None and w90_version < SPINOR_WANNIER_MIN_W90:
+        problems.append(
+            f"backend.{SPINOR_WANNIER_CAPABILITY}.wannier90_version="
+            f"{'.'.join(map(str, w90_version))} < 3"
+        )
+    if isinstance(commands, dict):
+        vasp_template = commands.get("04_wannier")
+        if (
+            isinstance(vasp_template, list)
+            and vasp_template
+            and isinstance(vasp_template[0], str)
+            and launcher
+            and str(vasp_template[0]) != str(launcher)
+        ):
+            problems.append(
+                "preprocess_inputs.commands.04_wannier 的 launcher 与 "
+                f"backend.{SPINOR_WANNIER_CAPABILITY}.vasp_launcher 不一致"
+            )
+        w90_template = commands.get("04_wannier90")
+        if (
+            isinstance(w90_template, list)
+            and w90_template
+            and isinstance(w90_template[0], str)
+            and w90_launcher
+            and str(w90_template[0]) != str(w90_launcher)
+        ):
+            problems.append(
+                "preprocess_inputs.commands.04_wannier90 的 launcher 与 "
+                f"backend.{SPINOR_WANNIER_CAPABILITY}.wannier90_launcher 不一致"
+            )
+    return problems
+
 
 def _default_import_probe(name: str) -> tuple[str, str]:
     try:
@@ -175,6 +257,7 @@ def check_commands(config: dict[str, Any], work_root: str, base: Path) -> list[d
         else:
             items.append(_item(f"wrap.{key}", f"wrapper {key} ({how})", "FAIL",
                                f"不存在: {resolved}"))
+    items.extend(check_interface_contract(config, commands, work_root))
     return items
 
 
@@ -197,6 +280,68 @@ def _scan_wrapper(stage_key: str, resolved: str) -> list[dict[str, str]]:
             items.append(_item(f"target.{label}.{target}", f"{label} target", "FAIL",
                                f"wrapper 声明但不存在: {target}"))
     return items
+
+
+def _wrapper_declared_versions(resolved: str) -> list[tuple[str, tuple[int, ...]]]:
+    """Static capability scan of a site launcher script (no execution)."""
+    declared: list[tuple[str, tuple[int, ...]]] = []
+    try:
+        head = Path(resolved).read_bytes()[:32768]
+    except OSError:
+        return declared
+    if b"\x00" in head[:1024]:
+        return declared
+    body = head.decode(errors="replace")
+    for target in dict.fromkeys(TARGET_PATH_RE.findall(body)):
+        vmatch = VASP_VERSION_RE.search(target)
+        wmatch = W90_VERSION_RE.search(target)
+        if vmatch:
+            declared.append(("vasp", tuple(int(p) for p in re.findall(r"\d+", vmatch.group(0)))))
+        elif wmatch:
+            declared.append(("w90", tuple(int(p) for p in re.findall(r"\d+", wmatch.group(0)))))
+    return declared
+
+
+def check_interface_contract(
+    config: dict[str, Any],
+    commands: dict[str, Any],
+    work_root: str,
+) -> list[dict[str, str]]:
+    """SOC/spinor Wannier requires a provably compatible VASP>=6.4 + W90>=3 site pair.
+
+    The capability declaration is cross-checked against the resolved
+    ``04_wannier`` wrapper: VASP 5.4.4 (or any wrapper that cannot statically
+    prove VASP>=6.4) must FAIL, never PASS, for spinor Wannier runs.
+    """
+    if not config.get("physics", {}).get("soc"):
+        return []
+    problems = list(capability_errors(config, commands))
+    if not problems:
+        template = commands.get("04_wannier")
+        if isinstance(template, list) and template:
+            resolved, _ = _resolve_wrapper(template, work_root)
+            if not resolved or not os.path.isfile(resolved):
+                problems.append("04_wannier wrapper 无法静态解析：无法证明 VASP>=6.4 兼容")
+            else:
+                declared = _wrapper_declared_versions(resolved)
+                vasp_versions = [version for label, version in declared if label == "vasp"]
+                if not vasp_versions:
+                    problems.append("04_wannier wrapper 未静态声明 VASP 版本（无法证明 spinor Wannier 兼容）")
+                elif max(vasp_versions) < SPINOR_WANNIER_MIN_VASP:
+                    problems.append(
+                        "04_wannier wrapper 静态声明 VASP "
+                        + ".".join(map(str, max(vasp_versions)))
+                        + " < 6.4（VASP5.x NCL Wannier90 接口已知崩溃）"
+                    )
+    if problems:
+        return [_item(
+            "interface.vasp_wannier", "VASP-Wannier90 interface contract", "FAIL",
+            "; ".join(problems),
+        )]
+    return [_item(
+        "interface.vasp_wannier", "VASP-Wannier90 interface contract", "PASS",
+        f"capability={SPINOR_WANNIER_CAPABILITY}: VASP>=6.4 + Wannier90>=3 已静态确认",
+    )]
 
 
 def _command_tokens(config: dict[str, Any]) -> list[str]:
