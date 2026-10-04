@@ -14,6 +14,7 @@ from w90flow.attempts import (
     validate_standalone_w90_kpoint_order,
 )
 from w90flow.pyw90_adapter import _resolve_executable
+from w90flow.structure import patch_wannier_uniform_grid, uniform_fractional_kpoints
 
 
 POSCAR = """Synthetic L1 fixture
@@ -158,6 +159,30 @@ Cartesian
 
 
 class KpointIndexValidationTests(unittest.TestCase):
+    def test_rectangular_mesh_uses_vasp_x_fastest_indices(self) -> None:
+        points = uniform_fractional_kpoints([2, 3, 2])
+        self.assertEqual(points[:6], [
+            [0.0, 0.0, 0.0], [0.5, 0.0, 0.0],
+            [0.0, 1 / 3, 0.0], [0.5, 1 / 3, 0.0],
+            [0.0, 2 / 3, 0.0], [0.5, 2 / 3, 0.0],
+        ])
+        self.assertEqual(points[6], [0.0, 0.0, 0.5])
+        self.assertEqual(len({tuple(p) for p in points}), 12)
+
+    def test_generated_win_matches_vasp_rectangular_mesh(self) -> None:
+        incar = 'WANNIER90_WIN = "\nnum_wann = 1\n"\n'
+        patched = patch_wannier_uniform_grid(incar, [2, 2, 1])
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / 'wannier90.win').write_text(patched)
+            self._write_ibzkpt(directory / 'IBZKPT', [
+                [0.0, 0.0, 0.0], [0.5, 0.0, 0.0],
+                [0.0, 0.5, 0.0], [0.5, 0.5, 0.0],
+            ])
+            result = validate_standalone_w90_kpoint_order(
+                directory / 'wannier90.win', directory / 'IBZKPT')
+            self.assertTrue(result['passed'])
+
     def _write_ibzkpt(self, path: Path, points: list[list[float]]) -> None:
         body = "\n".join(
             f"  {x:.7E} {y:.7E} {z:.7E}  1.0000000E+00" for x, y, z in points

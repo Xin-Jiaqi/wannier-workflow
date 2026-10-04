@@ -156,12 +156,17 @@ def render_gamma_kpoints(mesh: list[int], comment: str = "W90Flow automatic Gamm
 
 
 def uniform_fractional_kpoints(mesh: list[int]) -> list[list[float]]:
+    """Use VASP automatic-mesh indexing: x varies fastest, then y, then z.
+
+    Matching point sets is insufficient: eigenvalues and overlap matrices are
+    indexed by this order. The post-VASP IBZKPT comparison remains mandatory.
+    """
     nx, ny, nz = mesh
     return [
         [ix / nx, iy / ny, iz / nz]
-        for ix in range(nx)
-        for iy in range(ny)
         for iz in range(nz)
+        for iy in range(ny)
+        for ix in range(nx)
     ]
 
 
