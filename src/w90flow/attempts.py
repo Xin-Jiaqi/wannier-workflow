@@ -77,6 +77,31 @@ def _target_band_indices(energies: list[list[float]], target_min: float, target_
     return list(range(min(touched), max(touched) + 1))
 
 
+def target_occupation_coverage(
+    energies: list[list[float]], nelect: int, soc: bool,
+    target_min: float, target_max: float,
+) -> dict[str, Any]:
+    """Apply the existing optical quality gate before expensive attempts.
+
+    Uses the same integer-occupation convention and protected band interval
+    as planning/quality. It diagnoses the declared window; it never widens it.
+    """
+    occupied = int(round(nelect if soc else nelect / 2.0))
+    indices = _target_band_indices(energies, target_min, target_max)
+    target_occupied = sum(index <= occupied for index in indices)
+    passed = 0 < target_occupied < len(indices)
+    return {
+        "passed": passed,
+        "failure_class": None if passed else "TARGET_WINDOW_MISSING_OCCUPATION_SECTOR",
+        "target_energy_eV": [target_min, target_max],
+        "target_bands_1_based": indices,
+        "occupied_band_count": occupied,
+        "target_occupied_band_count": target_occupied,
+        "target_empty_band_count": len(indices) - target_occupied,
+        "policy": "require occupied and empty bands without changing the declared window",
+    }
+
+
 def _boundary_gaps(energies: list[list[float]], start: int, stop: int) -> dict[str, float | None]:
     nbands = len(energies[0])
     lower = None if start == 1 else min(row[start - 1] - row[start - 2] for row in energies)
@@ -714,6 +739,21 @@ def create_attempts(run_dir: str | Path) -> dict[str, Any]:
                 [energy - energy_offset for energy in row]
                 for row in uniform["energies_eV"]
             ])
+        coverage = target_occupation_coverage(
+            planning_energies, int(eig["nelect"]), bool(config["physics"].get("soc")),
+            target_min, target_max,
+        )
+        if not coverage["passed"]:
+            diagnostic = {
+                **coverage, "structure": sid, "energy_reference": energy_reference,
+                "fermi_eV": fermi,
+                "band_eigenval_sha256": sha256_file(base / "02_band/EIGENVAL"),
+            }
+            atomic_json(base / "target-window-diagnostic.json", diagnostic)
+            raise ValueError(
+                f"{coverage['failure_class']}: {sid} 的目标能区必须同时包含占据带和空带；"
+                "保持原目标窗口，停止创建 Wannier attempts。"
+            )
         absolute_target = [target_min + energy_offset, target_max + energy_offset]
         contexts[sid] = {
             "base": base,
