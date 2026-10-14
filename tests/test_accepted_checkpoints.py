@@ -32,6 +32,17 @@ def accepted(root: Path, sid: str = "sheet", candidate: str = "first") -> Path:
 
 
 class AcceptedCheckpointTests(unittest.TestCase):
+    def test_checkpoint_rejects_nested_identifiers_before_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            accepted(root)
+            for sid, candidate, attempt in [("../structures/sheet", "first", "attempt-001"),
+                                             ("sheet", "first/..", "attempt-001"),
+                                             ("sheet", "first", "..\\attempt-001")]:
+                with self.assertRaisesRegex(ValueError, "single path components"):
+                    checkpoint_accepted_candidate(root, [sid], candidate, attempt)
+            self.assertFalse((root / "accepted-checkpoints").exists())
+
     def test_parallel_failure_does_not_hide_another_workers_accepted_model(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

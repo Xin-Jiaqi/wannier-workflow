@@ -19,6 +19,9 @@ def checkpoint_accepted_candidate(
     run_dir: str | Path, structures: list[str], candidate: str, attempt: str,
 ) -> dict[str, Any]:
     root = Path(run_dir).resolve()
+    for label in [*structures, candidate, attempt]:
+        if not label or label in {".", ".."} or "/" in label or "\\" in label:
+            raise ValueError("checkpoint identifiers must be single path components")
     files: dict[str, Path] = {}
     for sid in structures:
         source = root / "structures" / sid / "04_wannier_attempts" / candidate / attempt
