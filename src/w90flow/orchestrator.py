@@ -603,6 +603,7 @@ def _run_candidate_search(
         return ([preserve(_process_candidate(root, structures, candidate, mpi_processes=mpi), structures)
                  for structures, candidate in layout], plan)
     results: list[dict[str, Any]] = []
+    first_failure: Exception | None = None
     with ThreadPoolExecutor(max_workers=int(plan["workers"]), thread_name_prefix="w90-candidate") as pool:
         futures = {
             pool.submit(_process_candidate, root, structures, candidate, mpi_processes=mpi): (structures, candidate)
@@ -610,7 +611,15 @@ def _run_candidate_search(
         }
         for future in as_completed(futures):
             structures, candidate = futures[future]
-            results.append(preserve(future.result(), structures))
+            try:
+                results.append(preserve(future.result(), structures))
+            except Exception as exc:
+                # Already-launched workers finish during executor shutdown.
+                # Drain them to preserve accepted models, then report failure.
+                if first_failure is None:
+                    first_failure = exc
+    if first_failure is not None:
+        raise first_failure
     order = {(tuple(structures), candidate): index for index, (structures, candidate) in enumerate(layout)}
     results.sort(key=lambda item: order[(tuple(item["structures"]), str(item["candidate"]))])
     return results, plan

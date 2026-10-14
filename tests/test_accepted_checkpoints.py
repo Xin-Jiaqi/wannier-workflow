@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -30,6 +32,32 @@ def accepted(root: Path, sid: str = "sheet", candidate: str = "first") -> Path:
 
 
 class AcceptedCheckpointTests(unittest.TestCase):
+    def test_parallel_failure_does_not_hide_another_workers_accepted_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            accepted(root, candidate="second")
+            failed = threading.Event()
+
+            def process(_root, _structures, candidate, **kwargs):
+                if candidate == "first":
+                    failed.set()
+                    raise RuntimeError("first worker failed")
+                self.assertTrue(failed.wait(1))
+                time.sleep(.05)
+                return {"passed": True, "candidate": "second", "attempt": "attempt-001"}
+
+            config = {"structures": [{"id": "sheet"}], "backend": {"mpi_processes": 1},
+                      "execution": {"candidate_search": {"policy": "candidate_parallel", "max_workers": 2}}}
+            spec = {"ensemble_mode": "independent", "independent_candidates": {
+                "sheet": [{"candidate": "first"}, {"candidate": "second"}]}}
+            with patch("w90flow.orchestrator.detect_resources", return_value={"available_cpus": 2, "memory_gib": 32}), \
+                 patch("w90flow.orchestrator._process_candidate", side_effect=process):
+                with self.assertRaisesRegex(RuntimeError, "first worker failed"):
+                    _run_candidate_search(root, config, spec)
+            packages = list((root / "accepted-checkpoints").glob("*/checkpoint.json"))
+            self.assertEqual(len(packages), 1)
+            self.assertEqual(json.loads(packages[0].read_text())["candidate"], "second")
+
     def test_later_candidate_crash_preserves_first_without_marking_complete(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
