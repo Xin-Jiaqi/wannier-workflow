@@ -274,3 +274,14 @@ v1.0 的冻结范围、输入/输出、有限重试表和验收门槛见 [AUTOMA
 必须通过插值误差、带隙/连接性、spread/中心、Hermiticity，以及（若请求）多结构
 共同基底检查。shift current/SHG 的 top-K 稳健性是下游物理分析，不反向改变本阶段
 的候选排名。
+# Accepted-model recovery checkpoints
+
+Candidate search now saves each quality-accepted candidate immediately under
+`RUN/accepted-checkpoints/<content-sha256>/`. The package includes its model,
+recorded quality checks, independent DFT path reference, and file hashes. It
+verifies the audited HR, Wannier output, and DFT reference before copying; a
+repeated checkpoint verifies existing content instead of overwriting it.
+
+These packages survive interruption of a later candidate. They do not mark the
+finite search complete, replace ranked Top-K exports, or certify NLO response.
+Search order, budgets, scientific inputs, and quality thresholds are unchanged.

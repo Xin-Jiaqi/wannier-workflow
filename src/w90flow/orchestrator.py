@@ -19,6 +19,7 @@ from .structure import resolve_periodicity, resolve_uniform_mesh
 from .quality import IncompleteTargetSubspace, evaluate_attempt, export_ranked_attempts, rank_attempts
 from .state import atomic_json, read_json, read_status, sha256_file, update_stage
 from .resources import candidate_search_plan, detect_resources
+from .checkpoints import checkpoint_accepted_candidate
 
 
 WORKFLOW_STOPS = ("scf", "band", "candidates", "wannier", "quality", "rank", "export")
@@ -591,8 +592,15 @@ def _run_candidate_search(
         max_workers=settings.get("max_workers", "auto"),
     )
     mpi = int(plan["mpi_processes_per_candidate"])
+    def preserve(result: dict[str, Any], structures: list[str]) -> dict[str, Any]:
+        if result.get("passed"):
+            result["accepted_checkpoint"] = checkpoint_accepted_candidate(
+                root, structures, str(result["candidate"]), str(result["attempt"]),
+            )["path"]
+        return {"structures": structures, **result}
+
     if int(plan["workers"]) == 1:
-        return ([{"structures": structures, **_process_candidate(root, structures, candidate, mpi_processes=mpi)}
+        return ([preserve(_process_candidate(root, structures, candidate, mpi_processes=mpi), structures)
                  for structures, candidate in layout], plan)
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=int(plan["workers"]), thread_name_prefix="w90-candidate") as pool:
@@ -602,7 +610,7 @@ def _run_candidate_search(
         }
         for future in as_completed(futures):
             structures, candidate = futures[future]
-            results.append({"structures": structures, **future.result()})
+            results.append(preserve(future.result(), structures))
     order = {(tuple(structures), candidate): index for index, (structures, candidate) in enumerate(layout)}
     results.sort(key=lambda item: order[(tuple(item["structures"]), str(item["candidate"]))])
     return results, plan
