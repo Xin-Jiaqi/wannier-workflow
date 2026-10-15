@@ -161,6 +161,18 @@ def _validate_execution_contract(
             f"当前为 {backend_vasp or '<missing>'}。"
         )
     mpi_processes = _positive_mpi_processes(backend.get("mpi_processes"), "backend.mpi_processes")
+    candidate_mpi = _positive_mpi_processes(
+        config.get("execution", {}).get("candidate_search", {}).get(
+            "mpi_processes_per_candidate", mpi_processes
+        ),
+        "execution.candidate_search.mpi_processes_per_candidate",
+    )
+    if candidate_mpi != mpi_processes:
+        raise ValueError(
+            "execution.candidate_search.mpi_processes_per_candidate="
+            f"{candidate_mpi} 与 backend.mpi_processes={mpi_processes} 不一致；"
+            "请同步更新候选任务与启动器核数后再运行 DFT。"
+        )
 
     if not isinstance(commands, dict):
         raise ValueError("preprocess_inputs.commands 必须是对象。")

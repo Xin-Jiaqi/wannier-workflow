@@ -179,6 +179,22 @@ MAGMOM = 9*0
                 self.assertFalse(campaign.exists())
                 self.assertFalse(runs.exists())
 
+    def test_candidate_mpi_mismatch_is_rejected_before_dft(self) -> None:
+        for policy in ("serial", "candidate_parallel"):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config, document, campaign, runs = self._fixture(root)
+                document.setdefault("execution", {})["candidate_search"] = {
+                    "policy": policy,
+                    "max_workers": 1,
+                    "mpi_processes_per_candidate": 32,
+                }
+                self._write(config, document)
+                with self.assertRaisesRegex(ValueError, "mpi_processes_per_candidate=32"):
+                    run_stage1_coldstart(config, campaign, runs, execute=True)
+                self.assertFalse(campaign.exists())
+                self.assertFalse(runs.exists())
+
     def test_soc_wannier_requires_compatible_capability(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
