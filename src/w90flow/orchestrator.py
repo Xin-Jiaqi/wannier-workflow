@@ -381,7 +381,7 @@ def choose_retry_reason(
     clean = {failure for failure in failures if failure}
     if "NEIGHBOUR_SHELL_FAILURE" in clean:
         raise WorkflowBlocked(
-            "Wannier kmesh 邻居向量生成失败；先用 -pp 有界检查 search_shells，"
+            "Wannier kmesh 邻居向量生成失败；先用 -pp 有界检查 kmesh_tol/search_shells，"
             "保留晶格、k 网格与精度门槛，不通过增加拟合迭代或更换能窗处理。"
         )
     if "INTERFACE_FAILURE" in clean:
@@ -542,7 +542,7 @@ def _process_candidate(
                 if failure_class == "NEIGHBOUR_SHELL_FAILURE":
                     raise WorkflowBlocked(
                         f"{sid}/{candidate}/{selected} Wannier 邻居向量生成失败；"
-                        "先执行 -pp/search_shells 有界预检，不属于拟合不收敛。"
+                        "先执行 -pp/kmesh_tol/search_shells 有界预检，不属于拟合不收敛。"
                     )
                 if failure_class == "INTERFACE_FAILURE":
                     raise WorkflowBlocked(

@@ -30,7 +30,7 @@ FAILURE_TRANSITIONS = {
     "INFRASTRUCTURE_FAILURE": "retry_same_attempt_once_after_environment_check",
     "INTERFACE_FAILURE": "stop_and_require_site_environment_fix",
     "KPOINT_INDEX_ORDER_MISMATCH": "rebuild_wannier_inputs_from_one_shared_explicit_mesh",
-    "NEIGHBOUR_SHELL_FAILURE": "check_bounded_search_shells_with_wannier_preprocessing_before_new_attempt",
+    "NEIGHBOUR_SHELL_FAILURE": "check_bounded_kmesh_tol_and_search_shells_with_wannier_preprocessing_before_new_attempt",
     "NUMERIC_FAILURE": "stop_and_require_manual_diagnosis",
 }
 
