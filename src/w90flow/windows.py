@@ -4,6 +4,37 @@ import math
 from typing import Any, Iterable
 
 
+def suggest_occupation_complete_window(
+    energies: list[list[float]], occupied: int,
+    target_min: float, target_max: float, margin_eV: float = 0.5,
+) -> dict[str, Any] | None:
+    """Propose a separately recorded gapped-band control; never apply it.
+
+    Preserve the entire requested window and cover the top valence and first
+    conduction band at every sampled k point. Metals and truncated DFT band
+    sets have no safe integer-occupation proposal under this policy.
+    """
+    if not energies or occupied < 1 or any(len(row) <= occupied for row in energies):
+        return None
+    if not math.isfinite(margin_eV) or margin_eV <= 0:
+        raise ValueError("margin_eV must be finite and positive")
+    valence = [row[occupied - 1] for row in energies]
+    conduction = [row[occupied] for row in energies]
+    if not all(math.isfinite(v) for v in [target_min, target_max, *valence, *conduction]):
+        return None
+    if target_min > target_max or min(conduction) <= max(valence):
+        return None
+    return {
+        "target_energy_eV": [min(target_min, min(valence) - margin_eV),
+                             max(target_max, max(conduction) + margin_eV)],
+        "input_target_energy_eV": [target_min, target_max],
+        "energy_reference": "same_as_input_eigenvalues",
+        "margin_eV": margin_eV,
+        "requires_new_protocol": True,
+        "status": "proposal_only; refit_and_quality_validation_required",
+    }
+
+
 def state_counts(energies: Iterable[Iterable[float]], window_min: float, window_max: float) -> list[int]:
     return [sum(window_min <= energy <= window_max for energy in row) for row in energies]
 

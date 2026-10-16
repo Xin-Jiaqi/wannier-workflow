@@ -16,7 +16,7 @@ import yaml  # type: ignore[import-untyped]
 
 from .parsers import parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_procar_orbital_scores, parse_wout
 from .state import atomic_json, read_json, sha256_file
-from .windows import minimum_outer_max, validate_frozen_window, validate_outer_window, validate_window_containment
+from .windows import minimum_outer_max, suggest_occupation_complete_window, validate_frozen_window, validate_outer_window, validate_window_containment
 
 
 FAILURE_TRANSITIONS = {
@@ -91,6 +91,11 @@ def target_occupation_coverage(
     indices = _target_band_indices(energies, target_min, target_max)
     target_occupied = sum(index <= occupied for index in indices)
     passed = 0 < target_occupied < len(indices)
+    integer_occupation = abs((nelect if soc else nelect / 2.0) - occupied) < 1e-8
+    proposal = (
+        suggest_occupation_complete_window(energies, occupied, target_min, target_max)
+        if not passed and integer_occupation else None
+    )
     return {
         "passed": passed,
         "failure_class": None if passed else "TARGET_WINDOW_MISSING_OCCUPATION_SECTOR",
@@ -100,6 +105,7 @@ def target_occupation_coverage(
         "target_occupied_band_count": target_occupied,
         "target_empty_band_count": len(indices) - target_occupied,
         "policy": "require occupied and empty bands without changing the declared window",
+        "separate_window_proposal": proposal,
     }
 
 
