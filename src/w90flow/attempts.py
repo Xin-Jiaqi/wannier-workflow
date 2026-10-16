@@ -30,6 +30,7 @@ FAILURE_TRANSITIONS = {
     "INFRASTRUCTURE_FAILURE": "retry_same_attempt_once_after_environment_check",
     "INTERFACE_FAILURE": "stop_and_require_site_environment_fix",
     "KPOINT_INDEX_ORDER_MISMATCH": "rebuild_wannier_inputs_from_one_shared_explicit_mesh",
+    "NEIGHBOUR_SHELL_FAILURE": "check_bounded_search_shells_with_wannier_preprocessing_before_new_attempt",
     "NUMERIC_FAILURE": "stop_and_require_manual_diagnosis",
 }
 
@@ -972,11 +973,15 @@ def import_completed_attempt(
 
 def classify_failure(directory: Path, returncode: int) -> str | None:
     text = ""
-    for name in ("runner.log", "wannier90.wout"):
+    names = ["runner.log", "wannier90.wout"]
+    names.extend(path.name for path in sorted(directory.glob("wannier90*.werr")))
+    for name in names:
         path = directory / name
         if path.is_file():
             text += "\n" + path.read_text(encoding="utf-8", errors="replace")
     lower = text.lower()
+    if "kmesh_get_bvector: not enough bvectors found" in lower:
+        return "NEIGHBOUR_SHELL_FAILURE"
     if (
         "no sockets were able to be opened" in lower
         or "bind() failed for port" in lower
