@@ -12,7 +12,7 @@ from typing import Any, Mapping
 
 import yaml  # type: ignore[import-untyped]
 
-from .candidates import num_wann_from_projection, suggest_projection_candidates
+from .candidates import candidate_dimension_budget, num_wann_from_projection, suggest_projection_candidates
 from .parsers import parse_eigenval, parse_fermi_outcar, parse_outcar_status, parse_poscar, parse_procar_orbital_scores, parse_wout
 from .paths import pyw90_executable as pyw90_executable_env
 from .pyw90_adapter import element_projection_envelope, run_dos_suggest
@@ -748,6 +748,20 @@ def generate_candidates(run_dir: str | Path) -> dict[str, Any]:
         "structures": analyses,
         **candidate_payload,
     }
+    # Preserve candidates excluded by the dimensional cap as diagnostic evidence.
+    # Do not silently turn a missing complete-shell trial into a fitting failure.
+    for sid, analysis in analyses.items():
+        unrestricted = suggest_projection_candidates(
+            analysis["projection_analysis"]["orbital_scores"],
+            element_counts_by_structure[sid], soc, chemical_valence,
+            shell_family_min_weight=shell_family_min_weight,
+            shell_combination_min_weight=shell_combination_min_weight,
+            max_num_wann=None, max_candidates=None,
+            external_candidates=pyw90_external([sid]),
+        )
+        analysis["candidate_dimension_budget"] = candidate_dimension_budget(
+            unrestricted, int(analysis["eigenval"]["nbands"]), max_model_fraction,
+        )
     output = root / "03_candidates/candidate-spec.json"
     atomic_json(output, payload)
     update_stage(root, "03_candidates", status="PASS", finished_utc=_utc_now(), outputs=[str(output)])
