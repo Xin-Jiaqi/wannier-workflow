@@ -10,7 +10,7 @@ from w90flow import supervisor
 class ImportPathTests(unittest.TestCase):
     def test_flat_baseline_precedes_stale_environment(self):
         with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp) / 'baseline'
+            base = Path(tmp).resolve() / 'baseline'
             module = base / 'w90flow/supervisor.py'
             module.parent.mkdir(parents=True)
             module.touch()
@@ -20,7 +20,7 @@ class ImportPathTests(unittest.TestCase):
 
     def test_repository_source_layout_remains_supported(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             module = root / 'src/w90flow/supervisor.py'
             module.parent.mkdir(parents=True)
             module.touch()
