@@ -524,6 +524,19 @@ def evaluate_attempt(
             "wannier90.wout": sha256_file(directory / "wannier90.wout"),
         },
     }
+    if (not passed and plan["mode"] == "disentanglement"
+            and (soc or eig["nelect"] % 2 == 0)
+            and not _parse_excluded(directory / "wannier90.win", eig["nbands"])):
+        from .windows import suggest_fixed_deep_band_exclusion
+        proposal = suggest_fixed_deep_band_exclusion(
+            eig["energies_eV"], original_occupied, hr["num_wann"],
+            *target_window_absolute,
+        )
+        if proposal is not None:
+            proposal["energy_reference"] = "absolute"
+            proposal["evidence_scope"] = "DFT reference band path"
+            proposal["requires_full_training_mesh_recheck"] = True
+            result["protected_subspace_proposal"] = proposal
     atomic_json(directory / "quality.json", result)
     record.update({
         "status": "ACCEPTED" if passed else "REJECTED_QUALITY",
