@@ -233,7 +233,8 @@ def _command(
     python: str | None = None,
 ) -> tuple[list[str], dict[str, str], Path]:
     package_root = Path(__file__).resolve().parents[2]
-    source_root = package_root / "src"
+    # Pin subprocesses to the package actually imported, including flat deployments.
+    source_root = Path(__file__).resolve().parents[1]
     environment = os.environ.copy()
     prior = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = str(source_root) if not prior else os.pathsep.join((str(source_root), prior))
