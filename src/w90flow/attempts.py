@@ -14,7 +14,7 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped]
 
-from .parsers import parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_procar_orbital_scores, parse_wout
+from .parsers import convergence_gate, parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_procar_orbital_scores, parse_wout
 from .state import atomic_json, read_json, sha256_file
 from .windows import minimum_outer_max, suggest_occupation_complete_window, validate_frozen_window, validate_outer_window, validate_window_containment
 
@@ -23,6 +23,8 @@ FAILURE_TRANSITIONS = {
     "NOT_ENOUGH_STATES": "expand_outer_window_to_next_required_band_edge",
     "TOO_MANY_FROZEN_STATES": "shrink_frozen_window_without_dropping_protected_target_bands",
     "DISENTANGLEMENT_NOT_CONVERGED": "increase_dis_num_iter_then_reduce_dis_mix_ratio_once",
+    "CONVERGENCE_UNVERIFIED": "stop_and_check_stage_convergence_evidence_and_log_version",
+    "W90_NOT_COMPLETED": "inspect_incomplete_wannier_outputs_before_retry",
     "LOCALIZATION_NOT_CONVERGED": "increase_num_iter_then_enable_guiding_centres_once",
     "BAND_CONNECTIVITY_FAILED": "change_projection_or_outer_window_not_localization_iterations",
     "QUALITY_GATE_FAILED": "protect_target_window_then_add_next_missing_orbital_shell",
@@ -972,8 +974,11 @@ def import_completed_attempt(
     for name in required_outputs:
         if not (source_dir / name).is_file():
             raise ValueError(f"来源 attempt 缺少完成输出：{name}")
-    if not parse_wout(source_dir / "wannier90.wout")["completed"]:
-        raise ValueError("来源 wannier90.wout 未正常完成。")
+    source_convergence = parse_wout(source_dir / "wannier90.wout")
+    source_failure = convergence_gate(source_convergence,
+        require_disentanglement=record.get("plan", {}).get("mode") != "exact")
+    if source_failure:
+        raise ValueError(f"来源 Wannier attempt 缺少严格收敛证据：{source_failure}")
     hr = parse_hr_header(source_dir / "wannier90_hr.dat")
     if int(hr["num_wann"]) != int(record["num_wann"]):
         raise ValueError("来源 HR 维数与目标 NUM_WANN 不一致。")
@@ -1292,11 +1297,14 @@ def run_attempt(
                     break
     required_outputs = [directory / name for name in ("wannier90.wout", "wannier90_hr.dat", "wannier90_centres.xyz", "wannier90_band.dat")]
     output_missing = [path.name for path in required_outputs if not path.is_file()]
-    completed = False
-    if (directory / "wannier90.wout").is_file():
-        completed = parse_wout(directory / "wannier90.wout")["completed"]
-    passed = returncode == 0 and not output_missing and completed
-    failure = None if passed else classify_failure(directory, returncode)
+    convergence = parse_wout(directory / "wannier90.wout") if (directory / "wannier90.wout").is_file() else {}
+    convergence_failure = convergence_gate(convergence,
+        require_disentanglement=record.get("plan", {}).get("mode") != "exact")
+    # Preserve execution/missing-output failures before evaluating scientific convergence.
+    failure = (classify_failure(directory, returncode) if returncode != 0 or output_missing
+               else convergence_failure)
+    passed = returncode == 0 and not output_missing and failure is None
+    record["convergence_check"] = convergence
     record.update({
         "status": "PASS" if passed else "FAIL",
         "finished_utc": _utc_now(),

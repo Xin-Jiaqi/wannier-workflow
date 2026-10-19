@@ -317,12 +317,33 @@ class RunAttemptKpointGuardTests(unittest.TestCase):
                 encoding="utf-8",
             )
             for name in ("wannier90.wout", "wannier90_hr.dat", "wannier90_centres.xyz", "wannier90_band.dat"):
-                (attempt / name).write_text("All done\n" if name == "wannier90.wout" else "x", encoding="utf-8")
+                (attempt / name).write_text("Disentanglement convergence criteria satisfied\nWannierisation convergence criteria satisfied\nAll done\n" if name == "wannier90.wout" else "x", encoding="utf-8")
             with mock.patch("w90flow.attempts.subprocess.Popen", return_value=self._fake_process()) as popen:
                 result = run_attempt(root, "X", "p-only", "attempt-001", execute=True)
             popen.assert_called_once()
             self.assertTrue(result["passed"])
             self.assertEqual(result["attempt"]["status"], "PASS")
+            self.assertEqual(result["attempt"]["standalone_w90_kpoint_order"]["passed"], True)
+            self.assertEqual(result["attempt"]["standalone_w90_kpoint_order"]["kpoint_count"], 2)
+            self.assertEqual(result["attempt"]["standalone_w90_post_vasp"]["shifted_components"], 1)
+
+    def test_normal_exit_without_convergence_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root, attempt = self._make_run(temporary)
+            (attempt / "IBZKPT").write_text(
+                "    2\n    2\n  2   1   1\n"
+                "  0.0000000E+00  0.0000000E+00  0.0000000E+00  1.0000000E+00\n"
+                "  5.0000000E-01  0.0000000E+00  0.0000000E+00  1.0000000E+00\n",
+                encoding="utf-8",
+            )
+            for name in ("wannier90.wout", "wannier90_hr.dat", "wannier90_centres.xyz", "wannier90_band.dat"):
+                (attempt / name).write_text("All done\n" if name == "wannier90.wout" else "x", encoding="utf-8")
+            with mock.patch("w90flow.attempts.subprocess.Popen", return_value=self._fake_process()) as popen:
+                result = run_attempt(root, "X", "p-only", "attempt-001", execute=True)
+            popen.assert_called_once()
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["attempt"]["status"], "FAIL")
+            self.assertEqual(result["attempt"]["failure_class"], "CONVERGENCE_UNVERIFIED")
             self.assertEqual(result["attempt"]["standalone_w90_kpoint_order"]["passed"], True)
             self.assertEqual(result["attempt"]["standalone_w90_kpoint_order"]["kpoint_count"], 2)
             self.assertEqual(result["attempt"]["standalone_w90_post_vasp"]["shifted_components"], 1)

@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
-from .parsers import count_wannier_centres, parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_wout
+from .parsers import convergence_gate, count_wannier_centres, parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_wout
 from .paths import matplotlib_cache_dir
 from .state import atomic_json, read_json, sha256_file, update_stage
 
@@ -287,8 +287,11 @@ def evaluate_run(run_dir: str | Path) -> dict[str, Any]:
         hr = parse_hr_header(wannier_dir / "wannier90_hr.dat")
         centres = count_wannier_centres(wannier_dir / "wannier90_centres.xyz")
         wout = parse_wout(wannier_dir / "wannier90.wout")
+        requires_disentanglement = bool(re.search(
+            r"(?im)^\s*dis_win_(min|max)\s*=", (wannier_dir / "wannier90.win").read_text()))
         checks = {
             "w90_completed": wout["completed"],
+            "w90_converged": convergence_gate(wout, require_disentanglement=requires_disentanglement) is None,
             "hr_centres_match": hr["num_wann"] == centres == len(w90),
             "rmse": metrics["rmse_mev"] <= thresholds["rmse_mev"],
             "p95": metrics["p95_mev"] <= thresholds["p95_mev"],
@@ -389,6 +392,15 @@ def evaluate_attempt(
     if record.get("status") not in {"PASS", "ACCEPTED", "REJECTED_QUALITY"}:
         raise ValueError(f"attempt 尚未成功完成数值计算：{record.get('status')}")
 
+    convergence = parse_wout(directory / "wannier90.wout") if (directory / "wannier90.wout").is_file() else {}
+    failure = convergence_gate(convergence,
+        require_disentanglement=record.get("plan", {}).get("mode") != "exact")
+    if failure:
+        rejected = {"schema_version": 1, "structure": structure, "candidate": candidate,
+                    "attempt": attempt, "passed": False, "failure_class": failure,
+                    "convergence_check": convergence, "checks": {"w90_converged": False}}
+        atomic_json(directory / "quality.json", rejected)
+        return rejected
     base = root / "structures" / structure
     band_dir = base / "02_band"
     eig = parse_eigenval(band_dir / "EIGENVAL")
@@ -464,9 +476,10 @@ def evaluate_attempt(
     metric_checks = _metric_checks(target_metrics, thresholds)
     hr = parse_hr_header(directory / "wannier90_hr.dat")
     centres = count_wannier_centres(directory / "wannier90_centres.xyz")
-    wout = parse_wout(directory / "wannier90.wout")
+    wout = convergence
     checks = {
         "w90_completed": bool(wout["completed"]),
+        "w90_converged": convergence_gate(wout, require_disentanglement=plan["mode"] != "exact") is None,
         "hr_centres_match": hr["num_wann"] == centres == len(w90_all),
         **metric_checks,
     }

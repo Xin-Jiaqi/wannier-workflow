@@ -156,9 +156,21 @@ def count_wannier_centres(path: str | Path) -> int:
 def parse_wout(path: str | Path) -> dict[str, Any]:
     text = Path(path).read_text(encoding="utf-8", errors="replace")
     spreads = [float(match.group(1).replace("D", "E")) for match in re.finditer(r"Omega Total\s*=\s*([-+0-9.EeDd]+)", text)]
+    def stage_status(stage: str) -> bool | None:
+        matches = re.findall(stage + r"\s+convergence criteria\s+(not\s+)?satisfied", text, re.I)
+        return not bool(matches[-1]) if matches else None
+    disentanglement = stage_status("disentanglement")
+    localization = stage_status("wannieri[sz]ation")
+    if localization is None and "CONVERGENCE ACHIEVED" in text:
+        localization = True
+    failure = ("DISENTANGLEMENT_NOT_CONVERGED" if disentanglement is False else
+               "LOCALIZATION_NOT_CONVERGED" if localization is False else None)
     return {
         "completed": "All done" in text,
-        "converged": "CONVERGENCE ACHIEVED" in text or "All done" in text,
+        "converged": localization is True and disentanglement is not False,
+        "disentanglement_converged": disentanglement,
+        "localization_converged": localization,
+        "convergence_failure": failure,
         "final_total_spread_ang2": spreads[-1] if spreads else None,
     }
 
@@ -296,3 +308,18 @@ def parse_procar_orbital_scores(
         "orbital_scores": normalized,
         "band_orbital_scores": band_orbital_scores,
     }
+
+
+def convergence_gate(status: dict[str, Any], *, require_disentanglement: bool) -> str | None:
+    """Require positive stage evidence, not merely successful termination."""
+    if not status.get("completed"):
+        return "W90_NOT_COMPLETED"
+    if status.get("disentanglement_converged") is False:
+        return "DISENTANGLEMENT_NOT_CONVERGED"
+    if status.get("localization_converged") is False:
+        return "LOCALIZATION_NOT_CONVERGED"
+    if status.get("localization_converged") is not True:
+        return "CONVERGENCE_UNVERIFIED"
+    if require_disentanglement and status.get("disentanglement_converged") is not True:
+        return "CONVERGENCE_UNVERIFIED"
+    return None
