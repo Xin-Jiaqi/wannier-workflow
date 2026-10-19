@@ -134,6 +134,10 @@ def load_project(path: str | Path) -> dict[str, Any]:
         raise ConfigError("iteration.max_window_attempts_per_candidate 必须在 1 到 4 之间。")
     if not 0 <= max_localization_retries <= 3:
         raise ConfigError("iteration.max_localization_retries 必须在 0 到 3 之间。")
+    budget_iterations = iteration.get("disentanglement_budget_iterations", 0)
+    if (type(budget_iterations) is not int or
+            budget_iterations != 0 and not 1000 <= budget_iterations <= 10000):
+        raise ConfigError("iteration.disentanglement_budget_iterations must be 0 or an integer from 1000 to 10000")
     output_top_k = int(data.get("ranking", {}).get("output_top_k", 3))
     if output_top_k <= 0:
         raise ConfigError("ranking.output_top_k 必须是正整数。")

@@ -394,6 +394,9 @@ def choose_retry_reason(
         raise WorkflowBlocked("数值失败不能通过自动放宽科学参数处理。")
     if "INFRASTRUCTURE_FAILURE" in clean:
         return "same"
+    if ("DISENTANGLEMENT_NOT_CONVERGED" in clean
+            and available_classes is not None and "disentanglement_budget" in available_classes):
+        return "disentanglement_budget"
     if clean & CONVERGENCE_FAILURES and (
         "convergence_retry" in available_classes
         if available_classes is not None

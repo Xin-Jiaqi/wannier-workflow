@@ -192,6 +192,7 @@ def _disentanglement_plans(
     target_max: float,
     max_window_attempts: int,
     max_localization_retries: int,
+    disentanglement_budget_iterations: int = 0,
 ) -> list[dict[str, Any]]:
     character = _candidate_character(band_features, projection)
     desired = set(target_indices)
@@ -234,6 +235,14 @@ def _disentanglement_plans(
         "dis_mix_ratio": 0.5,
     }
     plans = [seed]
+    if disentanglement_budget_iterations:
+        plans.append({
+            **seed,
+            "dis_num_iter": disentanglement_budget_iterations,
+            "retry_class": "disentanglement_budget",
+            "retry_index": 1,
+            "retry_reason": "disentanglement_budget_only",
+        })
     for retry_index in range(1, max_window_attempts):
         expansion = 0.5 * retry_index
         plans.append({
@@ -266,11 +275,15 @@ def plan_candidate(
     isolation_threshold_eV: float = 0.02,
     max_window_attempts: int = 2,
     max_localization_retries: int = 1,
+    disentanglement_budget_iterations: int = 0,
 ) -> list[dict[str, Any]]:
     if not 1 <= max_window_attempts <= 4:
         raise ValueError("有限状态机支持 1 到 4 个 window attempts。")
     if not 0 <= max_localization_retries <= 3:
         raise ValueError("有限状态机支持 0 到 3 个 localization retries。")
+    if (type(disentanglement_budget_iterations) is not int or
+            disentanglement_budget_iterations != 0 and not 1000 <= disentanglement_budget_iterations <= 10000):
+        raise ValueError("disentanglement_budget_iterations must be 0 or an integer from 1000 to 10000")
     target_indices = _target_band_indices(energies, target_min, target_max)
     # A Wannier Hamiltonian with fewer eigenvalues than the protected DFT band
     # manifold can never reproduce that manifold.  Reject it before launching
@@ -298,6 +311,7 @@ def plan_candidate(
         target_max,
         max_window_attempts,
         max_localization_retries,
+        disentanglement_budget_iterations,
     )
 
 
@@ -754,6 +768,7 @@ def create_attempts(run_dir: str | Path) -> dict[str, Any]:
     iteration = config.get("iteration", {})
     max_window_attempts = int(iteration.get("max_window_attempts_per_candidate", 2))
     max_localization_retries = int(iteration.get("max_localization_retries", 1))
+    disentanglement_budget_iterations = iteration.get("disentanglement_budget_iterations", 0)
     if not 1 <= max_window_attempts <= 4:
         raise ValueError("iteration.max_window_attempts_per_candidate 必须在 1 到 4 之间。")
     if not 0 <= max_localization_retries <= 3:
@@ -828,6 +843,7 @@ def create_attempts(run_dir: str | Path) -> dict[str, Any]:
                 isolation_threshold,
                 max_window_attempts,
                 max_localization_retries,
+                disentanglement_budget_iterations,
             )
     all_plans: dict[str, Any] = {}
     for structure in config["structures"]:
@@ -849,6 +865,7 @@ def create_attempts(run_dir: str | Path) -> dict[str, Any]:
                 isolation_threshold,
                 max_window_attempts,
                 max_localization_retries,
+                disentanglement_budget_iterations,
             )
             candidate_record = {"candidate": candidate, "attempts": []}
             if existing_projection == candidate["projection"] and (base / "05_quality/quality.json").is_file():
@@ -917,6 +934,7 @@ def create_attempts(run_dir: str | Path) -> dict[str, Any]:
         "iteration_budget": {
             "max_window_attempts_per_candidate": max_window_attempts,
             "max_localization_retries": max_localization_retries,
+            "disentanglement_budget_iterations": disentanglement_budget_iterations,
         },
         "common_plan_across_structures": mode == "common_basis",
         "structures": all_plans,
