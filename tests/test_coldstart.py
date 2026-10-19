@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,6 +60,15 @@ MAGMOM = 9*0
                 },
             },
         }, indent=2), encoding="utf-8")
+        vasp_bin = root / "fake-vasp.6.4.3-ncl"
+        vasp_bin.write_bytes(b"#!/bin/sh\n")
+        vasp_bin.chmod(vasp_bin.stat().st_mode | stat.S_IXUSR)
+        vasp_wrapper = root / "run-vasp.6.4.3-ncl"
+        w90_wrapper = root / "run-w90"
+        vasp_wrapper.write_text(f"#!/bin/bash\nVASP_BIN={vasp_bin}\n", encoding="utf-8")
+        w90_wrapper.write_text("#!/bin/bash\nexec wannier90.x\n", encoding="utf-8")
+        vasp_wrapper.chmod(vasp_wrapper.stat().st_mode | stat.S_IXUSR)
+        w90_wrapper.chmod(w90_wrapper.stat().st_mode | stat.S_IXUSR)
         document = {
             "schema_version": 1,
             "project": "synthetic_SOC_coldstart",
@@ -71,7 +81,17 @@ MAGMOM = 9*0
                 "target_energy_eV": [-6.0, 4.0],
             },
             "pseudopotentials": {"lock": "POTCAR_LOCK.json", "set": "XY_PBE"},
-            "backend": {"kind": "local_mpi", "vasp": "ncl", "mpi_processes": 4},
+            "backend": {
+                "kind": "local_mpi",
+                "vasp": "ncl",
+                "mpi_processes": 4,
+                "spinor_wannier_interface": {
+                    "vasp_launcher": str(vasp_wrapper),
+                    "vasp_version": "6.4.3",
+                    "wannier90_launcher": str(w90_wrapper),
+                    "wannier90_version": "3.1.0",
+                },
+            },
             "band_path": {"mode": "template", "points_per_segment": 31},
             "meshes": {"scf": [9, 9, 1], "wannier": [9, 9, 1]},
             "templates": {
@@ -100,8 +120,10 @@ MAGMOM = 9*0
                     "combined_sha256": combined,
                 },
                 "commands": {
-                    "02_scf": ["launcher", "{stage_dir}", "ncl", "4"],
-                    "03_band": ["launcher", "{stage_dir}", "ncl", "4"],
+                    "02_scf": [str(vasp_wrapper), "{stage_dir}", "ncl", "4"],
+                    "03_band": [str(vasp_wrapper), "{stage_dir}", "ncl", "4"],
+                    "04_wannier": [str(vasp_wrapper), "{stage_dir}", "ncl", "4"],
+                    "04_wannier90": [str(w90_wrapper), "{stage_dir}", "wannier90"],
                 },
             },
         }
@@ -156,6 +178,55 @@ MAGMOM = 9*0
                     plan_stage1_coldstart(config, campaign, runs)
                 self.assertFalse(campaign.exists())
                 self.assertFalse(runs.exists())
+
+    def test_candidate_mpi_mismatch_is_rejected_before_dft(self) -> None:
+        for policy in ("serial", "candidate_parallel"):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config, document, campaign, runs = self._fixture(root)
+                document.setdefault("execution", {})["candidate_search"] = {
+                    "policy": policy,
+                    "max_workers": 1,
+                    "mpi_processes_per_candidate": 32,
+                }
+                self._write(config, document)
+                with self.assertRaisesRegex(ValueError, "mpi_processes_per_candidate=32"):
+                    run_stage1_coldstart(config, campaign, runs, execute=True)
+                self.assertFalse(campaign.exists())
+                self.assertFalse(runs.exists())
+
+    def test_soc_wannier_requires_compatible_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config, document, campaign, runs = self._fixture(root)
+            del document["backend"]["spinor_wannier_interface"]
+            self._write(config, document)
+            with self.assertRaisesRegex(ValueError, "spinor_wannier_interface"):
+                plan_stage1_coldstart(config, campaign, runs)
+            self.assertFalse(campaign.exists())
+            self.assertFalse(runs.exists())
+
+    def test_soc_wannier_rejects_vasp544_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config, document, campaign, runs = self._fixture(root)
+            document["backend"]["spinor_wannier_interface"]["vasp_version"] = "5.4.4"
+            self._write(config, document)
+            with self.assertRaisesRegex(ValueError, "6.4"):
+                plan_stage1_coldstart(config, campaign, runs)
+            self.assertFalse(campaign.exists())
+            self.assertFalse(runs.exists())
+
+    def test_soc_wannier_rejects_launcher_not_from_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config, document, campaign, runs = self._fixture(root)
+            document["preprocess_inputs"]["commands"]["04_wannier"][0] = str(root / "other-wrapper")
+            self._write(config, document)
+            with self.assertRaisesRegex(ValueError, "04_wannier"):
+                plan_stage1_coldstart(config, campaign, runs)
+            self.assertFalse(campaign.exists())
+            self.assertFalse(runs.exists())
 
     def test_soc_magmom_cardinality_is_checked_in_memory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -1,0 +1,15 @@
+schema_version: 1
+project: Fixture_LiAuI4_BL_SOC_pair_v1
+structures:
+- id: LiAuI4_BL
+  poscar: ../../structures/LiAuI4/bilayer/POSCAR
+physics:
+  soc: true
+  dimensionality: 2
+backend:
+  kind: local_mpi
+  vasp: ncl
+  mpi_processes: 32
+  wannier_input_mode: standalone_win
+ranking:
+  output_top_k: 3

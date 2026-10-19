@@ -227,13 +227,19 @@ def _signal_checkpoint(callback: Callable[[int], None]) -> Iterator[None]:
             signal.signal(restored, previous)
 
 
-def _command(root: Path, target: str) -> tuple[list[str], dict[str, str], Path]:
+def _command(
+    root: Path,
+    target: str,
+    python: str | None = None,
+) -> tuple[list[str], dict[str, str], Path]:
     package_root = Path(__file__).resolve().parents[2]
-    source_root = package_root / "src"
+    # Pin subprocesses to the package actually imported, including flat deployments.
+    source_root = Path(__file__).resolve().parents[1]
     environment = os.environ.copy()
     prior = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = str(source_root) if not prior else os.pathsep.join((str(source_root), prior))
-    command = [sys.executable, "-m", "w90flow", "resume", str(root), "--until", target, "--execute"]
+    child_python = python or sys.executable
+    command = [child_python, "-m", "w90flow", "resume", str(root), "--until", target, "--execute"]
     return command, environment, package_root
 
 
@@ -326,6 +332,7 @@ def supervise_workflow(
     no_progress_seconds: float = 1800.0,
     stage_timeout_seconds: float = 86400.0,
     max_hours: float | None = None,
+    python: str | None = None,
 ) -> dict[str, Any]:
     """Advance one boundary at a time and poll without changing science input.
 
@@ -392,7 +399,7 @@ def supervise_workflow(
                     _append_log(root, f"PAUSED before {target}: {reason}")
                     return {"passed": True, **state}
 
-                command, environment, cwd = _command(root, target)
+                command, environment, cwd = _command(root, target, python=python)
                 child_log_path = root / f"supervisor-child-{target}.log"
                 _append_log(root, f"LAUNCH {target}: {' '.join(command)}")
                 with child_log_path.open("ab") as child_log:

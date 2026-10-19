@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from datetime import datetime, timezone
@@ -14,6 +15,20 @@ from .state import atomic_json, sha256_file
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?"
+
+
+def _resolve_executable(executable: str | Path | None) -> Path:
+    """Resolve an explicit path first, then a command available on PATH."""
+    if executable is None or not str(executable).strip():
+        raise ValueError("未提供 PyW90 可执行文件：请通过 --executable 或 W90FLOW_PYW90_EXECUTABLE 环境变量指定。")
+    raw = str(executable)
+    explicit = Path(raw).expanduser()
+    if explicit.is_file():
+        return explicit.resolve()
+    discovered = shutil.which(raw)
+    if discovered:
+        return Path(discovered).resolve()
+    raise ValueError(f"找不到 PyW90 可执行文件：{raw}")
 
 
 def _utc_now() -> str:
@@ -236,13 +251,9 @@ def run_eig_suggest(
 ) -> dict[str, Any]:
     """Run PyW90 as an optional, auditable baseline without changing decisions."""
     source = Path(eigenval).expanduser().resolve()
-    tool = Path(executable or pyw90_executable() or "").expanduser().resolve()
+    tool = _resolve_executable(executable or pyw90_executable())
     if not source.is_file():
         raise ValueError(f"找不到 EIGENVAL：{source}")
-    if not executable and not pyw90_executable():
-        raise ValueError("未提供 PyW90 可执行文件：请通过 --executable 或 W90FLOW_PYW90_EXECUTABLE 环境变量指定。")
-    if not tool.is_file():
-        raise ValueError(f"找不到 PyW90 可执行文件：{tool}")
     if num_wann <= 0:
         raise ValueError("num_wann 必须大于零。")
     low, high = map(float, target_energy_eV)
@@ -318,13 +329,9 @@ def run_dos_suggest(
 ) -> dict[str, Any]:
     """Run PyW90 DOS projection analysis in an isolated scratch directory."""
     source = Path(vasprun_xml).expanduser().resolve()
-    tool = Path(executable or pyw90_executable() or "").expanduser().resolve()
+    tool = _resolve_executable(executable or pyw90_executable())
     if not source.is_file() or source.name != "vasprun.xml":
         raise ValueError("vasprun_xml 必须指向名为 vasprun.xml 的文件。")
-    if not executable and not pyw90_executable():
-        raise ValueError("未提供 PyW90 可执行文件：请通过 --executable 或 W90FLOW_PYW90_EXECUTABLE 环境变量指定。")
-    if not tool.is_file():
-        raise ValueError(f"找不到 PyW90 可执行文件：{tool}")
     low, high = map(float, target_energy_eV)
     if low >= high:
         raise ValueError("目标能区下限必须小于上限。")

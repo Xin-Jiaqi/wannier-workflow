@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from itertools import combinations
+import math
 from typing import Any
 
 
@@ -10,6 +11,36 @@ COMPONENT_DEGENERACY = {
     "dxy": 1, "dyz": 1, "dz2": 1, "dxz": 1, "dx2": 1, "dx2-y2": 1,
 }
 ORBITAL_DEGENERACY = {**DEGENERACY, **COMPONENT_DEGENERACY}
+
+
+def candidate_dimension_budget(
+    candidates: list[dict[str, Any]], nbands: int, fraction: float,
+) -> dict[str, Any]:
+    """Explain projection exclusions without changing the configured search.
+
+    An exhausted narrow basis is different from an adequately explored model
+    space. Keep the original cap; report the DFT budget needed for each excluded
+    projection so a subsequent, separately recorded control can address it.
+    """
+    if isinstance(nbands, bool) or not isinstance(nbands, int) or nbands <= 0:
+        raise ValueError("nbands must be a positive integer")
+    if not math.isfinite(fraction) or not 0 < fraction <= 1:
+        raise ValueError("candidate fraction must be in (0, 1]")
+    limit = math.floor(nbands * fraction)
+    excluded = []
+    for candidate in candidates:
+        dimension = int(candidate["num_wann"])
+        if dimension > limit:
+            excluded.append({
+                "candidate": candidate["candidate"],
+                "projection": candidate["projection"],
+                "num_wann": dimension,
+                "reason": "insufficient_dft_bands" if dimension > nbands else "fraction_cap_only",
+                "minimum_nbands_at_current_fraction": math.ceil(dimension / fraction),
+            })
+    return {"nbands": nbands, "fraction": fraction, "maximum_num_wann": limit,
+            "excluded_candidates": excluded,
+            "policy": "diagnostic_only; no automatic cap or quality-gate change"}
 
 
 def _projection_order(label: str, element_order: list[str]) -> tuple[int, int, str]:

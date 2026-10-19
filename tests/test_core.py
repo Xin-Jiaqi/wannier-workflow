@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from w90flow.config import load_project
+from w90flow.state import sha256_file
 from w90flow.attempts import build_standalone_w90_input, canonicalize_standalone_w90_kpoints, classify_failure, import_completed_attempt, materialize_plan_energy_reference, plan_candidate, reconcile_mmn_neighbour_cells, recorded_or_classified_failure
 from w90flow.candidates import normalize_projection, num_wann_from_projection, suggest_projection_candidates
 from w90flow.dataset import make_attempt_record
@@ -411,6 +412,16 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(expanded[4]["retry_class"], "convergence_retry")
 
     def test_vasp54_standalone_win_preserves_candidate_dimension_and_controls(self) -> None:
+        poscar = """Synthetic L1 fixture
+1.0
+  3.000000  0.000000  0.000000
+  0.000000  3.000000  0.000000
+  0.000000  0.000000 20.000000
+X
+1
+Direct
+  0.000000  0.000000  0.500000
+"""
         incar = '''NBANDS = 48
 NUM_WANN = 22
 WANNIER90_WIN = "
@@ -429,6 +440,7 @@ precond = true
             num_wann=22,
             total_vasp_bands=64,
             plan={"mode": "exact", "exclude_bands_1_based": [*range(1, 5), *range(27, 65)]},
+            poscar_text=poscar,
         )
         self.assertIn("num_wann = 22", text)
         self.assertIn("num_bands = 22", text)
@@ -437,8 +449,21 @@ precond = true
         self.assertIn("bands_plot = true", text)
         self.assertIn("write_hr = true", text)
         self.assertNotIn("precond", text.lower())
+        self.assertIn("begin unit_cell_cart", text)
+        self.assertIn("begin atoms_cart", text)
+        self.assertRegex(text, r"X\s+0\.0000000\s+0\.0000000\s+10\.0000000")
 
     def test_vasp54_standalone_win_uses_all_bands_for_disentanglement(self) -> None:
+        poscar = """Synthetic L1 fixture
+1.0
+  3.000000  0.000000  0.000000
+  0.000000  3.000000  0.000000
+  0.000000  0.000000 20.000000
+X
+1
+Direct
+  0.000000  0.000000  0.500000
+"""
         incar = '''WANNIER90_WIN = "
 begin projections
 Mo:p
@@ -454,6 +479,7 @@ dis_win_max = 10
             num_wann=28,
             total_vasp_bands=64,
             plan={"mode": "disentanglement"},
+            poscar_text=poscar,
         )
         self.assertIn("num_wann = 28", text)
         self.assertIn("num_bands = 64", text)
@@ -577,6 +603,26 @@ end kpoint_path
             )
             self.assertEqual(classify_failure(path, 213), "INFRASTRUCTURE_FAILURE")
 
+    def test_wannier_interface_heap_corruption_is_interface_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "runner.log").write_text(
+                "Projection 72 done.\n"
+                "free(): corrupted unsorted chunks\n"
+                "BAD TERMINATION OF ONE OF YOUR APPLICATION PROCESSES\n"
+                "KILLED BY SIGNAL: 9 (Killed)\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(classify_failure(path, 255), "INTERFACE_FAILURE")
+
+    def test_interface_failure_is_not_numeric(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)
+            (path / "runner.log").write_text(
+                "Signal: 6 (Aborted)\nBAD TERMINATION\n", encoding="utf-8"
+            )
+            self.assertEqual(classify_failure(path, 134), "INTERFACE_FAILURE")
+
     def test_explicit_orphan_diagnosis_overrides_truncated_log(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary)
@@ -670,6 +716,16 @@ class RankingTests(unittest.TestCase):
                 "physics:\n  soc: true\n  dimensionality: 2\n  axes: [x, y, z]\n",
                 encoding="utf-8",
             )
+            reference = root / "structures/SnS2/02_band/EIGENVAL"
+            reference.parent.mkdir(parents=True)
+            reference.write_text("synthetic DFT reference")
+            (source / "wannier90.wout").write_text("Wannierisation convergence criteria satisfied\nAll done\n")
+            quality = {"passed": True, "checks": {name: True for name in (
+                "w90_completed", "w90_converged", "hr_centres_match", "rmse", "p95", "max", "gap")},
+                "source_sha256": {"EIGENVAL": sha256_file(reference),
+                                  **{name: sha256_file(source / name) for name in (
+                                      "wannier90_hr.dat", "wannier90.wout")}}}
+            (source / "quality.json").write_text(json.dumps(quality))
             result = export_ranked_attempts(root)
             package = Path(result["packages"][0]["path"])
             self.assertTrue((package / "SnS2/wannier90-wcenter.dat").is_file())
@@ -868,6 +924,8 @@ class WorkflowTests(unittest.TestCase):
         )
         with self.assertRaises(WorkflowBlocked):
             choose_retry_reason(["NUMERIC_FAILURE"], set())
+        with self.assertRaises(WorkflowBlocked):
+            choose_retry_reason(["INTERFACE_FAILURE"], set())
         self.assertEqual(
             choose_retry_reason(
                 ["LOCALIZATION_NOT_CONVERGED"],

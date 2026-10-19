@@ -22,6 +22,9 @@ jobs:
       - run: python -m mypy
       - run: python scripts/audit_repository.py
   secrets:
+    permissions:
+      contents: read
+      pull-requests: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

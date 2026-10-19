@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "cases": {
+    "LiAuI4_BL": {
+      "config_sha256": "cf2bd4c0ab29c54e64c1102fc8659c27824cf607e4b73e41f426634f552a3eee",
+      "poscar_sha256": "8513ce6f6f7e0a32bf5e26d296ccef567503e36de2bd3b767fdad334d275cba3",
+      "potcar_combined_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "CuI_BL": {
+      "config_sha256": "161a7cafd868bdd59887bae0aa90192f89a420575e0a2841e6ecbe6abfd6fa3e",
+      "poscar_sha256": "c904a56e52d6963c1f1eeaec54ac77b3ccd12bcf15920d26d7c6ea24840a2fa3",
+      "potcar_combined_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "PdS2_BL": {
+      "config_sha256": "cd981cecb7f95ab541e8414a60692552cf6a1ed5259104a86bcca462a5d19d45",
+      "poscar_sha256": "dc1b408e608d3651613606d4cf473629c4c221a57560a7f848770ffa31791e3b",
+      "potcar_combined_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "ZrI2_BL": {
+      "config_sha256": "e5030e938f141e450b0dae66f92c261fcab9b4e3aae6a0ae28384d162cee286c",
+      "poscar_sha256": "2436a8aff2ea19e1f66a7ebe3dffc7c38314c3cafce6069b2665c38600851895",
+      "potcar_combined_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "X2Y_BL": {
+      "config_sha256": "33076d056af2455b68ea91ac379ccf105e7bd4c5515ea74529d8f2c2bea3d784",
+      "poscar_sha256": "a81e39d652abbef1e719f2fd18574fd63567272877f7eac2d375b1a0f9810c63",
+      "potcar_combined_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "EVIL_BL": {
+      "config_sha256": "5dd5384bdd6758c2d3c40b048a33ca8e71a7f52e49bb06cd6074270241054430",
+      "poscar_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "scientific_inputs": {
+    "note": "synthetic site fixture for japan_runner tests"
+  },
+  "site": {
+    "scheduler": "pbs",
+    "standard_allocation": "select=1:ncpus=32:mpiprocs=32:ompthreads=1:mem=128gb"
+  }
+}

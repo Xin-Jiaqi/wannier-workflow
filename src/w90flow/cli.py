@@ -11,6 +11,7 @@ from .paths import runs_root
 from .attempts import create_attempts, import_completed_attempt, run_attempt
 from .candidates import suggest_projection_candidates
 from .executor import finalize_run, generate_candidates, import_completed_stage, prepare_run, reconcile_stage, run_vasp_stage
+from .japan_runner import site_qstat_active, site_qsub, submit_material
 from .parsers import parse_eigenval, parse_poscar
 from .pipeline import audit_reference, plan_project
 from .pyw90_adapter import run_eig_suggest
@@ -18,6 +19,7 @@ from .quality import evaluate_attempt, evaluate_run, export_ranked_attempts, ran
 from .ranking import audit_ranking_document
 from .material_pool import screen_c2db, write_material_pool
 from .orchestrator import WORKFLOW_STOPS, fit_from_precomputed, fit_from_preprocess, inspect_workflow, run_workflow
+from .run_material import run_material
 from .state import initialize_run, read_status, sha256_file
 from .preprocess import (
     PREPROCESS_STAGES,
@@ -34,6 +36,7 @@ from .structure import resolve_periodicity
 from .supervisor import inspect_supervisor, supervise_workflow
 from .windows import suggest_windows
 from .resources import candidate_search_plan, detect_resources
+from .doctor import doctor_cli
 
 
 def _emit(payload: Any) -> None:
@@ -162,6 +165,78 @@ def build_parser() -> argparse.ArgumentParser:
     coldstart.add_argument("--poll-seconds", type=float, default=30.0)
     coldstart.add_argument("--execute", action="store_true")
 
+    run_material_parser = sub.add_parser(
+        "run-material",
+        help="单材料生产入口：POSCAR→SCF→Band→候选→Wannier→质量→排名→导出；"
+             "统一终态 TOP3_READY/PARTIAL_TOPK/NO_MODEL/TECHNICAL_FAILED",
+    )
+    run_material_parser.add_argument("poscar", help="结构优化好的 POSCAR")
+    run_material_parser.add_argument("material_id", help="材料 ID（必须等于配置 structure id）")
+    run_material_parser.add_argument("--config", required=True, help="单结构 Stage-1 profile 配置")
+    run_material_parser.add_argument("--work-root", required=True, help="runs/campaigns 根目录")
+    run_material_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只读：输出 stage plan、输入指纹与复用条件；不创建状态、不提交计算",
+    )
+    run_material_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="继续已有非终态 campaign（成功 stage 不重跑，遵循现有 retry 语义）",
+    )
+    run_material_parser.add_argument("--poll-seconds", type=float, default=30.0)
+    run_material_parser.add_argument(
+        "--python",
+        default=None,
+        help="Stage1 supervisor/子进程 Python（默认继承本进程 sys.executable，禁止裸 python3）",
+    )
+    run_material_parser.add_argument(
+        "--reuse-from",
+        default=None,
+        metavar="PRIOR_RUN",
+        help="技术恢复：只读跨 run 复用科学指纹完全一致的 PASS preprocess/SCF/band/candidates；"
+             "默认关闭；失败 04_wannier 及之后绝不复用；prior run 只读、不假装新计算",
+    )
+
+    submit_material_parser = sub.add_parser(
+        "submit-material",
+        help="通用 Japan Stage-1 PBS 提交入口：material 必须存在于受控 cases manifest，"
+             "无材料白名单；提交前只读 preflight 并防重复",
+    )
+    submit_material_parser.add_argument("--material", required=True, help="受控 material_id（manifest 键）")
+    submit_material_parser.add_argument("--release", required=True, help="release 根目录（路径由 release/pool 根派生）")
+    submit_material_parser.add_argument("--work-root", required=True, help="runs/campaigns 根目录（immutable）")
+    submit_material_parser.add_argument("--pool", default=None, help="可选：pool 根目录覆盖（默认 release 下 test-pool-v01）")
+    submit_material_parser.add_argument("--manifest", default=None, help="可选：cases manifest 覆盖（默认 release/CONTROL/input-lock.json）")
+    submit_material_parser.add_argument("--python", default=None, help="可选：job 内 Python 解释器（默认提交进程 sys.executable）")
+    submit_material_parser.add_argument("--expected-commit", default=None, help="期望的 release source commit（可选强校验）")
+    submit_material_parser.add_argument("--poll-seconds", type=float, default=60.0)
+    submit_material_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只读：preflight + 渲染 PBS 脚本，不写状态、不 qsub",
+    )
+    submit_material_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="允许继续已有非终态 campaign（否则已存在 campaign 会被 preflight 拒绝）",
+    )
+    submit_material_parser.add_argument(
+        "--reuse-from",
+        default=None,
+        metavar="PRIOR_RUN",
+        help="技术恢复：原样传给 run-material --reuse-from（跨 run 复用指纹一致的 PASS 阶段，默认关闭）",
+    )
+
+    doctor = sub.add_parser(
+        "doctor",
+        help="Stage-1 环境/契约只读检查：Python 依赖、site 命令契约、POTCAR、"
+             "MPI/PBS、work-root、跨平台路径；不启动计算、不提交作业",
+    )
+    doctor.add_argument("--config", required=True, help="Stage-1 profile 配置")
+    doctor.add_argument("--work-root", required=True, help="runs/campaigns 根目录（只检查可写性）")
+    doctor.add_argument("--json", action="store_true", help="输出机器可读 JSON（FAIL 时退出码 1）")
+
     inspect = sub.add_parser("inspect", help="只读显示自动状态机的下一动作")
     inspect.add_argument("run_dir")
 
@@ -174,6 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
     supervise.add_argument("--no-progress-seconds", type=float, default=1800.0)
     supervise.add_argument("--stage-timeout-seconds", type=float, default=86400.0)
     supervise.add_argument("--max-hours", type=float)
+    supervise.add_argument("--python", default=None, help="child Python（默认继承本进程 sys.executable）")
 
     supervisor_status = sub.add_parser("supervisor-status", help="只读检查监督器、child 和实际 worker")
     supervisor_status.add_argument("run_dir")
@@ -363,6 +439,7 @@ def main(argv: list[str] | None = None) -> int:
                 no_progress_seconds=args.no_progress_seconds,
                 stage_timeout_seconds=args.stage_timeout_seconds,
                 max_hours=args.max_hours,
+                python=args.python,
             )
             _emit(result)
             return 0 if result.get("passed") or not args.execute else 1
@@ -394,6 +471,58 @@ def main(argv: list[str] | None = None) -> int:
             )
             _emit(result)
             return 0 if (not args.execute or result.get("status") == "COMPLETE") else 1
+        elif args.command == "run-material":
+            try:
+                result = run_material(
+                    args.poscar,
+                    args.material_id,
+                    args.config,
+                    args.work_root,
+                    dry_run=args.dry_run,
+                    resume=args.resume,
+                    poll_seconds=args.poll_seconds,
+                    python=args.python,
+                    reuse_from=args.reuse_from,
+                )
+            except (ValueError, RuntimeError) as exc:
+                _emit({
+                    "mode": "ERROR",
+                    "error_type": type(exc).__name__,
+                    "reason": str(exc),
+                    "exit_code": 1,
+                })
+                return 1
+            _emit(result)
+            return int(result["exit_code"])
+        elif args.command == "submit-material":
+            try:
+                result = submit_material(
+                    material_id=args.material,
+                    release_root=args.release,
+                    work_root=args.work_root,
+                    manifest_path=args.manifest,
+                    pool_root=args.pool,
+                    python=args.python,
+                    expected_release_commit=args.expected_commit,
+                    dry_run=args.dry_run,
+                    resume=args.resume,
+                    poll_seconds=args.poll_seconds,
+                    reuse_from=args.reuse_from,
+                    active_check=None if args.dry_run else site_qstat_active,
+                    qsub=None if args.dry_run else site_qsub,
+                )
+            except (ValueError, RuntimeError) as exc:
+                _emit({
+                    "mode": "ERROR",
+                    "error_type": type(exc).__name__,
+                    "reason": str(exc),
+                    "exit_code": 1,
+                })
+                return 1
+            _emit(result)
+            return 0 if result.get("passed") else 1
+        elif args.command == "doctor":
+            return doctor_cli(args)
         elif args.command == "audit-ranking":
             with Path(args.ranking_json).open("r", encoding="utf-8") as handle:
                 result = audit_ranking_document(json.load(handle))

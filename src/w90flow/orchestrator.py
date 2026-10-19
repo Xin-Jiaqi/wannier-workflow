@@ -12,6 +12,7 @@ from typing import Any, Mapping
 
 import yaml  # type: ignore[import-untyped]
 
+from .acceptance import strict_quality_passed
 from .attempts import create_attempts, recorded_or_classified_failure, run_attempt
 from .executor import generate_candidates, import_completed_stage, prepare_run, reconcile_stage, run_vasp_stage
 from .parsers import parse_poscar, parse_wout
@@ -19,6 +20,7 @@ from .structure import resolve_periodicity, resolve_uniform_mesh
 from .quality import IncompleteTargetSubspace, evaluate_attempt, export_ranked_attempts, rank_attempts
 from .state import atomic_json, read_json, read_status, sha256_file, update_stage
 from .resources import candidate_search_plan, detect_resources
+from .checkpoints import checkpoint_accepted_candidate
 
 
 WORKFLOW_STOPS = ("scf", "band", "candidates", "wannier", "quality", "rank", "export")
@@ -378,10 +380,23 @@ def choose_retry_reason(
 ) -> str | None:
     """Choose one finite deterministic branch; never relax quality thresholds."""
     clean = {failure for failure in failures if failure}
+    if "NEIGHBOUR_SHELL_FAILURE" in clean:
+        raise WorkflowBlocked(
+            "Wannier kmesh 邻居向量生成失败；先用 -pp 有界检查 kmesh_tol/search_shells，"
+            "保留晶格、k 网格与精度门槛，不通过增加拟合迭代或更换能窗处理。"
+        )
+    if "INTERFACE_FAILURE" in clean:
+        raise WorkflowBlocked(
+            "VASP/Wannier90 接口或工具链失败（全局技术故障）：需更换兼容的 site "
+            "VASP/Wannier90 组合；不自动放宽科学参数，不继续消耗候选。"
+        )
     if "NUMERIC_FAILURE" in clean:
         raise WorkflowBlocked("数值失败不能通过自动放宽科学参数处理。")
     if "INFRASTRUCTURE_FAILURE" in clean:
         return "same"
+    if ("DISENTANGLEMENT_NOT_CONVERGED" in clean
+            and available_classes is not None and "disentanglement_budget" in available_classes):
+        return "disentanglement_budget"
     if clean & CONVERGENCE_FAILURES and (
         "convergence_retry" in available_classes
         if available_classes is not None
@@ -527,7 +542,18 @@ def _process_candidate(
                 and not list(record.get("execution_history", []))
             ):
                 result = run_attempt(root, sid, candidate, selected, execute=True, mpi_processes=mpi_processes)
-                if not result.get("passed") and result["attempt"].get("failure_class") == "NUMERIC_FAILURE":
+                failure_class = result["attempt"].get("failure_class") if not result.get("passed") else None
+                if failure_class == "NEIGHBOUR_SHELL_FAILURE":
+                    raise WorkflowBlocked(
+                        f"{sid}/{candidate}/{selected} Wannier 邻居向量生成失败；"
+                        "先执行 -pp/kmesh_tol/search_shells 有界预检，不属于拟合不收敛。"
+                    )
+                if failure_class == "INTERFACE_FAILURE":
+                    raise WorkflowBlocked(
+                        f"{sid}/{candidate}/{selected} 接口/工具链失败：VASP-Wannier90 "
+                        "不兼容或进程崩溃（.amn/.eig 未生成），需更换 site 组合；不继续消耗候选。"
+                    )
+                if failure_class == "NUMERIC_FAILURE":
                     raise WorkflowBlocked(f"{sid}/{candidate}/{selected} 数值失败。")
 
 
@@ -548,10 +574,10 @@ def _accepted_coverage(root: Path, config: dict[str, Any], spec: dict[str, Any])
     for sid in structures:
         for quality_path in sorted((root / "structures" / sid / "04_wannier_attempts").glob("*/attempt-*/quality.json")):
             quality = read_json(quality_path)
-            if quality.get("passed"):
+            if strict_quality_passed(quality):
                 accepted[sid].append(f"{quality['candidate']}/{quality['attempt']}")
         baseline = root / "structures" / sid / "05_quality/quality.json"
-        if baseline.is_file() and read_json(baseline).get("passed"):
+        if baseline.is_file() and strict_quality_passed(read_json(baseline)):
             accepted[sid].append("baseline")
     if spec["ensemble_mode"] == "common_basis":
         common = set(accepted[structures[0]]) if structures else set()
@@ -580,10 +606,18 @@ def _run_candidate_search(
         max_workers=settings.get("max_workers", "auto"),
     )
     mpi = int(plan["mpi_processes_per_candidate"])
+    def preserve(result: dict[str, Any], structures: list[str]) -> dict[str, Any]:
+        if result.get("passed"):
+            result["accepted_checkpoint"] = checkpoint_accepted_candidate(
+                root, structures, str(result["candidate"]), str(result["attempt"]),
+            )["path"]
+        return {"structures": structures, **result}
+
     if int(plan["workers"]) == 1:
-        return ([{"structures": structures, **_process_candidate(root, structures, candidate, mpi_processes=mpi)}
+        return ([preserve(_process_candidate(root, structures, candidate, mpi_processes=mpi), structures)
                  for structures, candidate in layout], plan)
     results: list[dict[str, Any]] = []
+    first_failure: Exception | None = None
     with ThreadPoolExecutor(max_workers=int(plan["workers"]), thread_name_prefix="w90-candidate") as pool:
         futures = {
             pool.submit(_process_candidate, root, structures, candidate, mpi_processes=mpi): (structures, candidate)
@@ -591,7 +625,15 @@ def _run_candidate_search(
         }
         for future in as_completed(futures):
             structures, candidate = futures[future]
-            results.append({"structures": structures, **future.result()})
+            try:
+                results.append(preserve(future.result(), structures))
+            except Exception as exc:
+                # Already-launched workers finish during executor shutdown.
+                # Drain them to preserve accepted models, then report failure.
+                if first_failure is None:
+                    first_failure = exc
+    if first_failure is not None:
+        raise first_failure
     order = {(tuple(structures), candidate): index for index, (structures, candidate) in enumerate(layout)}
     results.sort(key=lambda item: order[(tuple(item["structures"]), str(item["candidate"]))])
     return results, plan

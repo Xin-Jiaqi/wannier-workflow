@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
-from .parsers import count_wannier_centres, parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_wout
+from .acceptance import require_audited_sources, strict_quality_passed
+from .parsers import convergence_gate, count_wannier_centres, parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_wout
 from .paths import matplotlib_cache_dir
 from .state import atomic_json, read_json, sha256_file, update_stage
 
@@ -287,8 +288,11 @@ def evaluate_run(run_dir: str | Path) -> dict[str, Any]:
         hr = parse_hr_header(wannier_dir / "wannier90_hr.dat")
         centres = count_wannier_centres(wannier_dir / "wannier90_centres.xyz")
         wout = parse_wout(wannier_dir / "wannier90.wout")
+        requires_disentanglement = bool(re.search(
+            r"(?im)^\s*dis_win_(min|max)\s*=", (wannier_dir / "wannier90.win").read_text()))
         checks = {
             "w90_completed": wout["completed"],
+            "w90_converged": convergence_gate(wout, require_disentanglement=requires_disentanglement) is None,
             "hr_centres_match": hr["num_wann"] == centres == len(w90),
             "rmse": metrics["rmse_mev"] <= thresholds["rmse_mev"],
             "p95": metrics["p95_mev"] <= thresholds["p95_mev"],
@@ -389,6 +393,19 @@ def evaluate_attempt(
     if record.get("status") not in {"PASS", "ACCEPTED", "REJECTED_QUALITY"}:
         raise ValueError(f"attempt 尚未成功完成数值计算：{record.get('status')}")
 
+    convergence = parse_wout(directory / "wannier90.wout") if (directory / "wannier90.wout").is_file() else {}
+    failure = convergence_gate(convergence,
+        require_disentanglement=record.get("plan", {}).get("mode") != "exact")
+    if failure:
+        rejected = {"schema_version": 1, "structure": structure, "candidate": candidate,
+                    "attempt": attempt, "passed": False, "failure_class": failure,
+                    "convergence_check": convergence, "checks": {"w90_converged": False}}
+        atomic_json(directory / "quality.json", rejected)
+        record.update({"status": "REJECTED_QUALITY", "failure_class": failure,
+                       "quality": str(directory / "quality.json"),
+                       "quality_evaluated_utc": datetime.now(timezone.utc).isoformat()})
+        atomic_json(record_path, record)
+        return rejected
     base = root / "structures" / structure
     band_dir = base / "02_band"
     eig = parse_eigenval(band_dir / "EIGENVAL")
@@ -464,9 +481,10 @@ def evaluate_attempt(
     metric_checks = _metric_checks(target_metrics, thresholds)
     hr = parse_hr_header(directory / "wannier90_hr.dat")
     centres = count_wannier_centres(directory / "wannier90_centres.xyz")
-    wout = parse_wout(directory / "wannier90.wout")
+    wout = convergence
     checks = {
         "w90_completed": bool(wout["completed"]),
+        "w90_converged": convergence_gate(wout, require_disentanglement=plan["mode"] != "exact") is None,
         "hr_centres_match": hr["num_wann"] == centres == len(w90_all),
         **metric_checks,
     }
@@ -524,6 +542,19 @@ def evaluate_attempt(
             "wannier90.wout": sha256_file(directory / "wannier90.wout"),
         },
     }
+    if (not passed and plan["mode"] == "disentanglement"
+            and (soc or eig["nelect"] % 2 == 0)
+            and not _parse_excluded(directory / "wannier90.win", eig["nbands"])):
+        from .windows import suggest_fixed_deep_band_exclusion
+        proposal = suggest_fixed_deep_band_exclusion(
+            eig["energies_eV"], original_occupied, hr["num_wann"],
+            *target_window_absolute,
+        )
+        if proposal is not None:
+            proposal["energy_reference"] = "absolute"
+            proposal["evidence_scope"] = "DFT reference band path"
+            proposal["requires_full_training_mesh_recheck"] = True
+            result["protected_subspace_proposal"] = proposal
     atomic_json(directory / "quality.json", result)
     record.update({
         "status": "ACCEPTED" if passed else "REJECTED_QUALITY",
@@ -697,14 +728,15 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
             results.append({
                 "candidate": raw["candidate"],
                 "attempt": "baseline",
-                "projection": raw["projection"],
-                "num_wann": raw["num_wann"],
+                "projection": raw.get("projection", []),
+                "num_wann": raw.get("num_wann", 0),
                 "nocc_model": raw.get("nocc_model"),
                 "metrics": raw["metrics"],
                 "native_model_metrics": raw["metrics"],
                 "final_total_spread_ang2": raw.get("final_total_spread_ang2"),
                 "mean_spread_per_wf_ang2": None if raw.get("final_total_spread_ang2") is None else raw["final_total_spread_ang2"] / raw["num_wann"],
-                "passed": raw["passed"],
+                "passed": strict_quality_passed(raw),
+                "acceptance_note": None if strict_quality_passed(raw) else "current_convergence_quality_audit_required",
                 "quality": str(baseline),
                 "candidate_family": metadata.get("candidate_family", "legacy_baseline"),
                 "integrated_weight_fraction": metadata.get("integrated_weight_fraction"),
@@ -715,14 +747,15 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
             results.append({
                 "candidate": raw["candidate"],
                 "attempt": raw["attempt"],
-                "projection": raw["projection"],
-                "num_wann": raw["num_wann"],
+                "projection": raw.get("projection", []),
+                "num_wann": raw.get("num_wann", 0),
                 "nocc_model": raw.get("nocc_model"),
-                "metrics": raw["target_metrics"],
+                "metrics": raw.get("target_metrics", {}),
                 "native_model_metrics": raw.get("native_model_metrics"),
                 "final_total_spread_ang2": raw.get("final_total_spread_ang2"),
                 "mean_spread_per_wf_ang2": raw.get("mean_spread_per_wf_ang2"),
-                "passed": raw["passed"],
+                "passed": strict_quality_passed(raw),
+                "acceptance_note": None if strict_quality_passed(raw) else "current_convergence_quality_audit_required",
                 "quality": str(quality_path),
                 "candidate_family": metadata.get("candidate_family"),
                 "integrated_weight_fraction": metadata.get("integrated_weight_fraction"),
@@ -887,6 +920,16 @@ def export_ranked_attempts(run_dir: str | Path) -> dict[str, Any]:
             raise ValueError("independent 排名没有通过项，不能导出。")
     else:
         raise ValueError(f"未知 ensemble_mode：{ensemble_mode}")
+    # Validate every selected source before creating any output package.
+    for item in export_entries:
+        for sid, member in item["members"].items():
+            quality_path = Path(member["quality"]).resolve()
+            source = quality_path.parent
+            require_audited_sources(read_json(quality_path), {
+                "EIGENVAL": root / "structures" / sid / "02_band/EIGENVAL",
+                "wannier90_hr.dat": source / "wannier90_hr.dat",
+                "wannier90.wout": source / "wannier90.wout",
+            })
     output.mkdir(parents=True, exist_ok=True)
     packages: list[dict[str, Any]] = []
 

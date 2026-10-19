@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import socket
 import time
 from datetime import datetime, timezone
@@ -27,7 +28,7 @@ from .preprocess import (
     validate_incar_structure_compatibility,
     validate_potcar_recipe,
 )
-from .state import atomic_json, read_json, sha256_file
+from .state import atomic_json, read_json, sha256_file, update_stage
 from .structure import resolve_periodicity
 from .supervisor import supervise_workflow
 
@@ -160,6 +161,18 @@ def _validate_execution_contract(
             f"当前为 {backend_vasp or '<missing>'}。"
         )
     mpi_processes = _positive_mpi_processes(backend.get("mpi_processes"), "backend.mpi_processes")
+    candidate_mpi = _positive_mpi_processes(
+        config.get("execution", {}).get("candidate_search", {}).get(
+            "mpi_processes_per_candidate", mpi_processes
+        ),
+        "execution.candidate_search.mpi_processes_per_candidate",
+    )
+    if candidate_mpi != mpi_processes:
+        raise ValueError(
+            "execution.candidate_search.mpi_processes_per_candidate="
+            f"{candidate_mpi} 与 backend.mpi_processes={mpi_processes} 不一致；"
+            "请同步更新候选任务与启动器核数后再运行 DFT。"
+        )
 
     if not isinstance(commands, dict):
         raise ValueError("preprocess_inputs.commands 必须是对象。")
@@ -187,6 +200,54 @@ def _validate_execution_contract(
                 f"与 backend.mpi_processes={mpi_processes} 不一致。"
             )
         checked[stage] = {"vasp": command_vasp, "mpi_processes": command_mpi}
+
+    wannier_vasp = commands.get("04_wannier")
+    if (
+        not isinstance(wannier_vasp, list)
+        or len(wannier_vasp) < 3
+        or any(not isinstance(item, str) for item in wannier_vasp)
+    ):
+        raise ValueError(
+            "preprocess_inputs.commands.04_wannier 必须是参数列表，末两项依次为 std/ncl 与 MPI 数。"
+        )
+    wannier_vasp_kind = wannier_vasp[-2].strip().lower()
+    if wannier_vasp_kind != expected_backend:
+        raise ValueError(
+            f"preprocess_inputs.commands.04_wannier 应使用 {expected_backend}；当前为 {wannier_vasp_kind}。"
+        )
+    wannier_mpi = _positive_mpi_processes(
+        wannier_vasp[-1], "preprocess_inputs.commands.04_wannier MPI 数"
+    )
+    if wannier_mpi != mpi_processes:
+        raise ValueError(
+            f"preprocess_inputs.commands.04_wannier MPI 数 {wannier_mpi} "
+            f"与 backend.mpi_processes={mpi_processes} 不一致。"
+        )
+    wannier90 = commands.get("04_wannier90")
+    if (
+        not isinstance(wannier90, list)
+        or len(wannier90) < 3
+        or any(not isinstance(item, str) for item in wannier90)
+    ):
+        raise ValueError(
+            "preprocess_inputs.commands.04_wannier90 必须是至少 3 项参数列表，末项固定为 wannier90。"
+        )
+    if wannier90[-1] != "wannier90":
+        raise ValueError(
+            "preprocess_inputs.commands.04_wannier90 末项必须是固定逻辑 seed wannier90；"
+            f"当前为 {wannier90[-1]!r}。"
+        )
+    checked["04_wannier"] = {"vasp": wannier_vasp_kind, "mpi_processes": wannier_mpi}
+    checked["04_wannier90"] = {"seed": wannier90[-1]}
+
+    from .doctor import capability_errors
+
+    capability_problems = capability_errors(config, commands)
+    if capability_problems:
+        raise ValueError(
+            "SOC/spinor Wannier 需要兼容 site capability（VASP>=6.4 + Wannier90>=3）："
+            + "；".join(capability_problems)
+        )
     return {
         "physics_soc": requested_soc,
         "backend_vasp": backend_vasp,
@@ -347,6 +408,40 @@ def plan_stage1_coldstart(config_path: str | Path, campaign_dir: str | Path, run
     }
 
 
+def coldstart_signature(config_file: str | Path, plan: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Canonical input signature shared by coldstart and the run-material entry."""
+    signature = {
+        "config": str(Path(config_file).expanduser().resolve()),
+        "config_sha256": sha256_file(config_file),
+        "structures": {item["id"]: item["poscar_sha256"] for item in plan["structures"]},
+        "immutable_input_sha256": plan["immutable_input_sha256"],
+    }
+    signature_sha256 = hashlib.sha256(
+        json.dumps(signature, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return signature, signature_sha256
+
+
+def derived_preprocess_run(
+    runs_root: str | Path,
+    project: str,
+    structure_id: str,
+    poscar_sha256: str,
+    signature_sha256: str,
+) -> Path:
+    """Deterministic preprocess run path for one structure (single source of truth)."""
+    return (
+        Path(runs_root).expanduser().resolve()
+        / "preprocess"
+        / f"{project}-{structure_id}-{signature_sha256[:8]}-{poscar_sha256[:8]}"
+    )
+
+
+def derived_wannier_run(runs_root: str | Path, project: str, signature_sha256: str) -> Path:
+    """Deterministic Wannier run path for one coldstart campaign (single source of truth)."""
+    return Path(runs_root).expanduser().resolve() / f"{project}-coldstart-{signature_sha256[:16]}"
+
+
 def _save(path: Path, state: dict[str, Any], status: str, **extra: Any) -> dict[str, Any]:
     state.update({"schema_version": 1, "updated_utc": _utc_now(), "status": status, **extra})
     atomic_json(path, state)
@@ -398,6 +493,390 @@ def _advance_preprocess(
         raise RuntimeError(f"{structure_id} preprocess 未通过：{result}")
 
 
+def _verify_preprocess_reuse_source(
+    preprocess_run: str | Path,
+    structure: dict[str, Any],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Read-only verification of one prior preprocess/SCF/Band source.
+
+    Scientific fingerprint = protocol_sha256 + POSCAR + POTCAR combined +
+    INCAR/KPOINTS template hashes + PASS stage status + complete band handoff.
+    Launcher/commands and Python paths are deliberately NOT part of the
+    fingerprint, so a pure environment fix keeps reuse valid.
+    """
+    root = Path(preprocess_run).expanduser().resolve()
+    sid = str(structure["id"])
+    protocol_path = root / "protocol.json"
+    lock_path = root / "input-lock.json"
+    if not protocol_path.is_file() or not lock_path.is_file():
+        raise ValueError(f"{sid} reuse 源不是完整 preprocess run（缺 protocol.json/input-lock.json）：{root}")
+    expected_protocol = str(structure["preprocess_protocol_sha256"])
+    stored_protocol = read_json(protocol_path)
+    if str(stored_protocol.get("protocol_sha256") or "") != expected_protocol:
+        raise ValueError(
+            f"{sid} 科学协议哈希不一致（protocol 变化，拒绝复用）："
+            f"{stored_protocol.get('protocol_sha256', '?')[:8]}… != {expected_protocol[:8]}…"
+        )
+    input_lock = read_json(lock_path)
+    locked_poscar = (input_lock.get("files") or {}).get("POSCAR") or {}
+    if locked_poscar.get("sha256") != str(structure["poscar_sha256"]):
+        raise ValueError(f"{sid} POSCAR 哈希不一致，拒绝复用")
+    materialized = input_lock.get("materialized_files") or {}
+    potcar_record = materialized.get("POTCAR") or {}
+    expected_potcar = (structure.get("preflight") or {}).get("potcar", {}).get("combined_sha256")
+    if not expected_potcar or potcar_record.get("sha256") != expected_potcar:
+        raise ValueError(f"{sid} POTCAR combined 哈希不一致，拒绝复用")
+    templates = (plan.get("immutable_input_sha256") or {}).get("preprocess_templates") or {}
+    active = sorted((structure.get("preflight") or {}).get("incar") or {})
+    if not active:
+        raise ValueError(f"{sid} 当前计划无激活 preprocess 阶段，拒绝复用")
+    template_hashes: dict[str, str] = {}
+    for stage in active:
+        for role in ("incar", "kpoints"):
+            record = materialized.get(f"{stage}:{role.upper()}") or {}
+            expected = templates.get(f"{stage}:{role}")
+            if not record.get("sha256") or record["sha256"] != expected:
+                raise ValueError(f"{sid} {stage} {role} 模板哈希不一致（kmesh/INCAR 变化，拒绝复用）")
+            template_hashes[f"{stage}:{role}"] = record["sha256"]
+        state_path = root / stage / "stage.json"
+        if not state_path.is_file():
+            raise ValueError(f"{sid} 缺少 {stage}/stage.json，拒绝复用")
+        status = str(read_json(state_path).get("status"))
+        if status != "PASS":
+            raise ValueError(f"{sid}/{stage} 状态是 {status}（非 PASS），拒绝复用")
+    handoff_path = root / "03_band/band-handoff.json"
+    if not handoff_path.is_file():
+        raise ValueError(f"{sid} 缺少 03_band/band-handoff.json（Band 未交接），拒绝复用")
+    handoff_files = read_json(handoff_path).get("files")
+    if not isinstance(handoff_files, dict) or not handoff_files:
+        raise ValueError(f"{sid} band-handoff 无 files 记录，拒绝复用")
+    for name, record in handoff_files.items():
+        path = root / "03_band" / name
+        if not isinstance(record, dict) or not path.is_file() or record.get("sha256") != sha256_file(path):
+            raise ValueError(f"{sid} Band 产物 {name} 缺失或哈希改变，拒绝复用")
+    return {
+        "source_run": str(root),
+        "source_stage": "preprocess",
+        "stage_status": "PASS",
+        "hashes": {
+            "protocol_sha256": expected_protocol,
+            "poscar_sha256": str(structure["poscar_sha256"]),
+            "potcar_sha256": str(expected_potcar),
+            "templates": template_hashes,
+        },
+    }
+
+
+def _as_bool(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"expected bool, got {type(value).__name__}")
+    return value
+
+
+_CANDIDATE_POLICY_METADATA_KEYS = frozenset({"role", "description", "comment", "note", "reason"})
+_CANDIDATE_POLICY_SCHEMA: dict[str, Any] = {
+    "max_candidates": int,
+    "max_num_wann_fraction_of_bands": float,
+    "shell_family_min_weight": float,
+    "shell_combination_min_weight": float,
+    "chemical_valence_used": _as_bool,
+    "pyw90_dos": {
+        "enabled": _as_bool,
+        "required": _as_bool,
+        "lower_bound": float,
+    },
+}
+
+
+def _canonicalize_candidate_policy(
+    policy: dict[str, Any],
+    *,
+    source: str,
+    schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Canonicalize a candidate policy to the scientific fields that matter.
+
+    Only keys in the explicit science schema are compared.  Known metadata
+    keys (role/description/comment/note/reason) are dropped.  Any other
+    unknown key is treated conservatively as possibly scientific and rejects
+    reuse, unless it can be proven to be metadata by name.
+    """
+    schema = _CANDIDATE_POLICY_SCHEMA if schema is None else schema
+    if not isinstance(policy, dict):
+        raise ValueError(f"候选策略无效（{source}），拒绝复用 candidates")
+    canonical: dict[str, Any] = {}
+    for key, converter in schema.items():
+        if key not in policy:
+            raise ValueError(f"候选策略缺少科学字段 {key}（{source}），拒绝复用 candidates")
+        if isinstance(converter, dict):
+            canonical[key] = _canonicalize_candidate_policy(
+                policy[key], source=f"{source}.{key}", schema=converter
+            )
+        else:
+            try:
+                canonical[key] = converter(policy[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"候选策略字段 {key} 无法转换（{source}）：{policy[key]!r}") from exc
+    for key in policy:
+        if key not in schema and key not in _CANDIDATE_POLICY_METADATA_KEYS:
+            raise ValueError(
+                f"候选策略含未知字段 {key}（{source}），无法证明是 metadata，拒绝复用 candidates"
+            )
+    return canonical
+
+
+def _verify_candidates_reuse_source(
+    wannier_prior: str | Path,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Read-only verification of a prior PASS 03_candidates stage."""
+    root = Path(wannier_prior).expanduser().resolve()
+    stage_path = root / "03_candidates/stage.json"
+    spec_path = root / "03_candidates/candidate-spec.json"
+    if not stage_path.is_file() or str(read_json(stage_path).get("status")) != "PASS":
+        raise ValueError(f"候选源 03_candidates 不是 PASS，拒绝复用：{root}")
+    if not spec_path.is_file():
+        raise ValueError(f"候选源缺少 candidate-spec.json，拒绝复用：{root}")
+    spec = read_json(spec_path)
+    physics = config.get("physics") or {}
+    candidates = config.get("candidates") or {}
+    pyw90 = candidates.get("pyw90_dos") or {}
+    expected_ids = {str(item["id"]) for item in config["structures"]}
+    spec_structures = spec.get("structures")
+    if not isinstance(spec_structures, dict) or set(spec_structures) != expected_ids:
+        raise ValueError("候选结构覆盖不一致，拒绝复用 candidates")
+    policy = {
+        "max_candidates": int(candidates.get("max_candidates", 8)),
+        "max_num_wann_fraction_of_bands": float(candidates.get("max_num_wann_fraction_of_bands", 1.0)),
+        "shell_family_min_weight": float(candidates.get("shell_family_min_weight", 0.08)),
+        "shell_combination_min_weight": float(candidates.get("shell_combination_min_weight", 0.45)),
+        "chemical_valence_used": _as_bool(bool(candidates.get("chemical_valence"))),
+        "pyw90_dos": {
+            "enabled": _as_bool(bool(pyw90.get("enabled", False))),
+            "required": _as_bool(bool(pyw90.get("required", False))),
+            "lower_bound": float(pyw90.get("lower_bound", 0.1)),
+        },
+    }
+    if spec.get("ensemble_mode") != str(config.get("ensemble", {}).get("mode", "independent")):
+        raise ValueError("候选 ensemble 模式不一致，拒绝复用 candidates")
+    if bool(spec.get("soc")) != bool(physics.get("soc")):
+        raise ValueError("候选 SOC 设定不一致，拒绝复用 candidates")
+    if spec.get("energy_reference") != physics.get("energy_reference"):
+        raise ValueError("候选能量参考不一致，拒绝复用 candidates")
+    target = [float(physics["target_energy_eV"][0]), float(physics["target_energy_eV"][1])]
+    if list(spec.get("target_energy_eV") or []) != target:
+        raise ValueError("候选目标能窗不一致，拒绝复用 candidates")
+    spec_policy = _canonicalize_candidate_policy(
+        spec.get("candidate_policy") or {}, source="candidate-spec"
+    )
+    expected_policy = _canonicalize_candidate_policy(policy, source="config")
+    if spec_policy != expected_policy:
+        raise ValueError("候选策略不一致，拒绝复用 candidates")
+    files = [spec_path]
+    for dos in sorted(root.glob("03_candidates/pyw90-dos-*.json")):
+        files.append(dos)
+    return {
+        "source_run": str(root),
+        "source_stage": "03_candidates",
+        "stage_status": "PASS",
+        "files": [{"path": str(path), "sha256": sha256_file(path)} for path in files],
+        "candidate_spec_sha256": sha256_file(spec_path),
+    }
+
+
+def _resolve_legacy_preprocess_sources(
+    prior: Path,
+    structure_ids: list[str],
+) -> tuple[dict[str, str], tuple[str, str]]:
+    """Resolve preprocess parents from legacy root-level import manifests.
+
+    Stage1 Wannier runs recorded explicit parent references in
+    ``01_scf/import-manifest.json`` and ``02_band/import-manifest.json`` at the
+    run root (``results[].source`` points into the preprocess run).  Some
+    fixtures/layouts use ``02_scf``/``03_band`` for the same pair, so both
+    stage-name pairs are probed; the first pair with complete manifests wins.
+    Directory paths are never guessed: when neither pair has complete evidence,
+    the caller must pass the preprocess run directly as ``--reuse-from``.
+    """
+    stage_pairs = (("01_scf", "02_band"), ("02_scf", "03_band"))
+    manifests: dict[str, dict[str, dict[str, Any]]] | None = None
+    used_pairs: tuple[str, str] | None = None
+    for scf_stage, band_stage in stage_pairs:
+        scf_manifest = prior / scf_stage / "import-manifest.json"
+        band_manifest = prior / band_stage / "import-manifest.json"
+        if not scf_manifest.is_file() or not band_manifest.is_file():
+            continue
+        parsed: dict[str, dict[str, dict[str, Any]]] = {}
+        for stage, manifest_path in ((scf_stage, scf_manifest), (band_stage, band_manifest)):
+            document = read_json(manifest_path)
+            results = document.get("results") if isinstance(document, dict) else None
+            if not isinstance(results, list) or not results:
+                raise ValueError(f"候选源 {stage}/import-manifest.json 无 results 记录，拒绝解析 parent")
+            by_structure: dict[str, dict[str, Any]] = {}
+            for record in results:
+                if isinstance(record, dict) and isinstance(record.get("structure"), str):
+                    by_structure[str(record["structure"])] = record
+            parsed[stage] = by_structure
+        manifests = parsed
+        used_pairs = (scf_stage, band_stage)
+        break
+    if manifests is None or used_pairs is None:
+        raise ValueError(
+            "候选源无法解析 SCF parent run：run 根级既无 "
+            "01_scf/02_band 也无 02_scf/03_band 的完整 import-manifest；"
+            "拒绝猜测目录，请直接传 preprocess run 作为 --reuse-from"
+        )
+    parents: dict[str, str] = {}
+    for sid in structure_ids:
+        scf_record = manifests[used_pairs[0]].get(sid)
+        band_record = manifests[used_pairs[1]].get(sid)
+        if not scf_record or not band_record:
+            raise ValueError(
+                f"候选源（旧版布局）缺少 {sid} 的 SCF/Band parent 记录，拒绝猜测目录；"
+                "请直接传 preprocess run 作为 --reuse-from"
+            )
+        scf_source = scf_record.get("source")
+        band_source = band_record.get("source")
+        if not isinstance(scf_source, str) or not isinstance(band_source, str):
+            raise ValueError(f"候选源（旧版布局）{sid} 的 import source 无效，拒绝解析 parent")
+        scf_parent = Path(scf_source).expanduser().resolve().parent
+        band_parent = Path(band_source).expanduser().resolve().parent
+        if scf_parent != band_parent:
+            raise ValueError(f"候选源（旧版布局）{sid} 的 SCF/Band parent 不一致，拒绝复用")
+        if not scf_parent.is_dir():
+            raise ValueError(f"候选源（旧版布局）{sid} 的 SCF parent 不存在：{scf_parent}")
+        parents[sid] = str(scf_parent)
+    return parents, used_pairs
+
+
+def verify_reuse_source(
+    prior_run: str | Path,
+    config_file: str | Path,
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Read-only gate for ``--reuse-from`` (technical-recovery cross-run reuse).
+
+    The prior run is never modified.  Only PASS preprocess/SCF/band (and,
+    when the prior run is a Stage1 Wannier run, PASS 03_candidates) with a
+    hash-identical scientific fingerprint are accepted.  Parent references are
+    resolved through the prior run's own import manifests, never guessed.
+    """
+    prior = Path(prior_run).expanduser().resolve()
+    config = load_project(Path(config_file).expanduser().resolve())
+    if not prior.is_dir():
+        raise ValueError(f"--reuse-from 目标不是目录：{prior}")
+    if (prior / "protocol.json").is_file() and (prior / "input-lock.json").is_file():
+        preprocess_sources = {str(item["id"]): str(prior) for item in plan["structures"]}
+        candidates_info = None
+        layout_version = "preprocess"
+        scf_stage_label, band_stage_label = "02_scf", "03_band"
+    elif (prior / "03_candidates/stage.json").is_file():
+        structure_ids = [str(item["id"]) for item in plan["structures"]]
+        per_structure_manifests = [
+            prior / "structures" / sid / "02_scf/import-manifest.json"
+            for sid in structure_ids
+        ]
+        present = [manifest.is_file() for manifest in per_structure_manifests]
+        if all(present):
+            preprocess_sources = {}
+            for item in plan["structures"]:
+                sid = str(item["id"])
+                manifest = prior / "structures" / sid / "02_scf/import-manifest.json"
+                results = read_json(manifest).get("results") or []
+                if not results or not results[0].get("source"):
+                    raise ValueError(f"SCF import manifest 无 source 记录：{manifest}")
+                parent = Path(str(results[0]["source"])).expanduser().resolve().parent
+                if not parent.is_dir():
+                    raise ValueError(f"SCF parent run 不存在：{parent}")
+                preprocess_sources[sid] = str(parent)
+            layout_version = "current"
+            scf_stage_label, band_stage_label = "02_scf", "03_band"
+        elif not any(present):
+            preprocess_sources, (scf_stage_label, band_stage_label) = _resolve_legacy_preprocess_sources(
+                prior, structure_ids
+            )
+            layout_version = "legacy"
+        else:
+            raise ValueError(
+                "候选源同时含新版与旧版 SCF import manifest，拒绝猜测目录；"
+                "请直接传 preprocess run 作为 --reuse-from"
+            )
+        candidates_info = _verify_candidates_reuse_source(prior, config)
+        candidates_info["source_layout_version"] = layout_version
+        candidates_info["preprocess_parents"] = dict(preprocess_sources)
+    else:
+        raise ValueError(
+            "--reuse-from 必须是 preprocess run（含 protocol.json/input-lock.json）"
+            "或 Stage1 Wannier run（含 03_candidates）"
+        )
+    preprocess_verified: dict[str, Any] = {}
+    for item in plan["structures"]:
+        sid = str(item["id"])
+        source = preprocess_sources[sid]
+        preprocess_verified[sid] = _verify_preprocess_reuse_source(source, item, plan)
+    stages: dict[str, Any] = {"preprocess": preprocess_verified}
+    for sid, verified in preprocess_verified.items():
+        stages.setdefault("scf", {})[sid] = {
+            "source_run": preprocess_sources[sid],
+            "source_stage": scf_stage_label,
+            "stage_status": "PASS",
+            "source_layout_version": layout_version,
+            "hashes": verified["hashes"],
+        }
+        stages.setdefault("band", {})[sid] = {
+            "source_run": preprocess_sources[sid],
+            "source_stage": band_stage_label,
+            "stage_status": "PASS",
+            "source_layout_version": layout_version,
+            "hashes": verified["hashes"],
+        }
+    if candidates_info is not None:
+        stages["candidates"] = candidates_info
+    return {
+        "schema_version": 1,
+        "mode": "technical_recovery_reuse",
+        "prior_run": str(prior),
+        "source_layout_version": layout_version,
+        "preprocess_sources": preprocess_sources,
+        "candidates": candidates_info,
+        "stages": stages,
+    }
+
+
+def _apply_reuse_candidates(wannier_run: Path, candidates_info: dict[str, Any]) -> dict[str, Any]:
+    """Copy hash-verified candidate artifacts into the new immutable run."""
+    target = wannier_run / "03_candidates"
+    target.mkdir(parents=True, exist_ok=True)
+    copied: list[dict[str, Any]] = []
+    for record in candidates_info.get("files") or []:
+        source = Path(str(record["path"])).expanduser().resolve()
+        if not source.is_file():
+            raise ValueError(f"候选源文件缺失：{source}")
+        if sha256_file(source) != record.get("sha256"):
+            raise ValueError(f"候选源文件哈希改变：{source}")
+        destination = target / source.name
+        if not destination.exists():
+            try:
+                os.link(source, destination)
+            except OSError:
+                shutil.copy2(source, destination)
+        elif sha256_file(destination) != record["sha256"]:
+            raise ValueError(f"候选目标已存在且哈希不同：{destination}")
+        copied.append({"source": str(source), "target": str(destination), "sha256": record["sha256"]})
+    update_stage(
+        wannier_run,
+        "03_candidates",
+        status="PASS",
+        reused_utc=_utc_now(),
+        provenance={
+            "source_run": str(candidates_info.get("source_run")),
+            "source_stage": "03_candidates",
+        },
+    )
+    return {"stage": "03_candidates", "status": "PASS", "copied": copied}
+
+
 def run_stage1_coldstart(
     config_path: str | Path,
     campaign_dir: str | Path,
@@ -405,6 +884,8 @@ def run_stage1_coldstart(
     *,
     execute: bool = False,
     poll_seconds: float = 30.0,
+    python: str | None = None,
+    reuse: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     plan = plan_stage1_coldstart(config_path, campaign_dir, runs_root)
     if not execute:
@@ -417,15 +898,7 @@ def run_stage1_coldstart(
     campaign.mkdir(parents=True, exist_ok=True)
     state_path = campaign / STATE_FILE
     config = load_project(config_file)
-    signature = {
-        "config": str(config_file),
-        "config_sha256": sha256_file(config_file),
-        "structures": {item["id"]: item["poscar_sha256"] for item in plan["structures"]},
-        "immutable_input_sha256": plan["immutable_input_sha256"],
-    }
-    signature_sha256 = hashlib.sha256(
-        json.dumps(signature, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    signature, signature_sha256 = coldstart_signature(config_file, plan)
 
     with ColdStartLock(campaign):
         if state_path.is_file():
@@ -435,8 +908,13 @@ def run_stage1_coldstart(
         else:
             preprocess_runs = {
                 item["id"]: str(
-                    runs / "preprocess" /
-                    f"{config['project']}-{item['id']}-{signature_sha256[:8]}-{item['poscar_sha256'][:8]}"
+                    derived_preprocess_run(
+                        runs,
+                        config["project"],
+                        item["id"],
+                        item["poscar_sha256"],
+                        signature_sha256,
+                    )
                 )
                 for item in plan["structures"]
             }
@@ -457,6 +935,15 @@ def run_stage1_coldstart(
             sid = str(structure["id"])
             poscar = Path(structure["poscar_resolved"])
             protocol, inputs = _resolve_preprocess_inputs(config_file, poscar)
+            plan_item = next(item for item in plan["structures"] if item["id"] == sid)
+            if reuse and reuse.get("preprocess_sources", {}).get(sid):
+                preprocess_run = Path(reuse["preprocess_sources"][sid])
+                verified = _verify_preprocess_reuse_source(preprocess_run, plan_item, plan)
+                state.setdefault("preprocess_reuse", {})[sid] = verified
+                _save(state_path, state, "PREPROCESS_REUSED", current_structure=sid,
+                      source_run=str(preprocess_run))
+                sources[sid] = str(preprocess_run)
+                continue
             preprocess_run = Path(state["preprocess_runs"][sid])
             if not preprocess_run.exists():
                 _save(state_path, state, "PREPROCESS_PREPARING", current_structure=sid)
@@ -491,10 +978,7 @@ def run_stage1_coldstart(
                     f"记录的 Wannier run 未完成不可变导入；拒绝创建重复 run：{wannier_run}"
                 )
         else:
-            wannier_run = runs / (
-                f"{config['project']}-coldstart-"
-                f"{signature_sha256[:16]}"
-            )
+            wannier_run = derived_wannier_run(runs, config["project"], signature_sha256)
             state["wannier_run"] = str(wannier_run)
             _save(state_path, state, "WANNIER_BOOTSTRAPPING", preprocess_sources=sources)
             bootstrapped = fit_from_preprocess(
@@ -506,6 +990,19 @@ def run_stage1_coldstart(
             )
             if Path(bootstrapped["run_dir"]) != wannier_run:
                 raise RuntimeError("bootstrap 返回了非预期的 Wannier run_dir。")
+            if reuse:
+                provenance = {
+                    "schema_version": 1,
+                    "mode": "technical_recovery_reuse",
+                    "created_utc": _utc_now(),
+                    "prior_run": reuse["prior_run"],
+                    "stages": reuse["stages"],
+                    "imported_via": "fit_from_preprocess/import_completed_stage (hash-verified parent references)",
+                }
+                if reuse.get("candidates"):
+                    applied = _apply_reuse_candidates(wannier_run, reuse["candidates"])
+                    provenance["candidates_files"] = applied["copied"]
+                atomic_json(wannier_run / "00_reuse/provenance.json", provenance)
             _save(state_path, state, "WANNIER_BOOTSTRAPPED", preprocess_sources=sources)
 
         _save(state_path, state, "WANNIER_RUNNING", wannier_run=str(wannier_run))
@@ -517,6 +1014,7 @@ def run_stage1_coldstart(
             heartbeat_seconds=max(60.0, poll_seconds),
             no_progress_seconds=3600.0,
             stage_timeout_seconds=172800.0,
+            python=python,
         )
         workflow = inspect_workflow(wannier_run)
         if workflow["next_action"]["action"] == "complete":

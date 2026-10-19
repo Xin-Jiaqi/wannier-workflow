@@ -12,9 +12,9 @@ from typing import Any, Mapping
 
 import yaml  # type: ignore[import-untyped]
 
-from .candidates import num_wann_from_projection, suggest_projection_candidates
+from .candidates import candidate_dimension_budget, num_wann_from_projection, suggest_projection_candidates
 from .parsers import parse_eigenval, parse_fermi_outcar, parse_outcar_status, parse_poscar, parse_procar_orbital_scores, parse_wout
-from .paths import launcher_root, pyw90_executable as pyw90_executable_env
+from .paths import pyw90_executable as pyw90_executable_env
 from .pyw90_adapter import element_projection_envelope, run_dos_suggest
 from .state import atomic_json, initialize_run, read_json, sha256_file, update_stage
 from .structure import (
@@ -210,9 +210,16 @@ def prepare_run(
             elif short_stage == "band" and band_path is not None:
                 _write_exact_text(directory / "KPOINTS", band_path["kpoints_text"])
                 generated_inputs["band_kpoints"] = "native_ase_path"
-            elif short_stage in {"scf", "wannier"} and resolved_mesh:
+            elif short_stage == "wannier" and resolved_mesh:
+                # VASP 5.4.4 PEAD/Wannier runs require automatic Gamma mesh
+                # syntax.  The standalone .win remains kx-fastest and is
+                # validated against VASP's emitted IBZKPT before Wannier90.
                 _write_exact_text(directory / "KPOINTS", render_gamma_kpoints(resolved_mesh))
-                generated_inputs[f"{short_stage}_mesh"] = resolved_mesh
+                generated_inputs["wannier_mesh"] = resolved_mesh
+                generated_inputs["wannier_kpoints"] = "automatic_gamma_mesh_win_validated_against_ibzkpt"
+            elif short_stage == "scf" and resolved_mesh:
+                _write_exact_text(directory / "KPOINTS", render_gamma_kpoints(resolved_mesh))
+                generated_inputs["scf_mesh"] = resolved_mesh
             else:
                 _copy_exact(Path(templates["kpoints_resolved"]), directory / "KPOINTS")
             links[directory_name] = _link_or_copy(private_potcar, directory / "POTCAR")
@@ -237,18 +244,77 @@ def prepare_run(
     return run_dir
 
 
-def _launcher(run_dir: Path, config: dict[str, Any], directory: Path) -> list[str]:
-    workspace = launcher_root()
-    executable = workspace / "00_命令入口/计算/运行VASP.command"
+def _expand_command_template(template: list[str], directory: Path, run_dir: Path) -> list[str]:
+    """Expand the site command placeholders; no shell-level string concatenation."""
+    return [
+        item.replace("{stage_dir}", str(directory)).replace("{run_dir}", str(run_dir))
+        for item in template
+    ]
+
+
+_COMMAND_STAGE_KEYS = {"scf": "02_scf", "band": "03_band", "wannier": "04_wannier"}
+
+
+def _launcher(run_dir: Path, config: dict[str, Any], directory: Path, stage: str) -> list[str]:
+    """Resolve the VASP launcher from the explicit site ``preprocess_inputs.commands``.
+
+    SCF/Band keep their existing ``02_scf``/``03_band`` keys; the Wannier stage
+    uses the same contract under ``04_wannier`` so all three stages share one
+    site launcher.  No ``W90FLOW_LAUNCHER_ROOT``/home fallback is applied.
+    """
+    commands = config.get("preprocess_inputs", {}).get("commands")
+    if not isinstance(commands, dict):
+        raise ValueError("Stage-1 配置缺少 preprocess_inputs.commands（无法解析 VASP launcher）。")
+    key = _COMMAND_STAGE_KEYS.get(stage)
+    if key is None:
+        raise ValueError(f"未知 VASP 阶段：{stage}")
+    template = commands.get(key)
     backend = config.get("backend", {})
     default_kind = "ncl" if config.get("physics", {}).get("soc") else "std"
-    return [str(executable), str(directory), str(backend.get("vasp", default_kind)), str(backend.get("mpi_processes", 2))]
+    kind = str(backend.get("vasp", default_kind))
+    mpi = str(backend.get("mpi_processes", 2))
+    if (
+        not isinstance(template, list)
+        or len(template) < 3
+        or any(not isinstance(item, str) for item in template)
+    ):
+        raise ValueError(
+            f"preprocess_inputs.commands.{key} 必须是参数列表，末两项依次为 std/ncl 与 MPI 数。"
+        )
+    if template[-2].strip().lower() != kind:
+        raise ValueError(
+            f"preprocess_inputs.commands.{key} 应使用 {kind}；当前为 {template[-2]}。"
+        )
+    if str(template[-1]) != mpi:
+        raise ValueError(
+            f"preprocess_inputs.commands.{key} MPI 数 {template[-1]} "
+            f"与 backend.mpi_processes={mpi} 不一致。"
+        )
+    return _expand_command_template(template, directory, run_dir)
 
 
-def _wannier_launcher(directory: Path) -> list[str]:
-    workspace = launcher_root()
-    executable = workspace / "00_命令入口/计算/运行Wannier90.command"
-    return [str(executable), str(directory), "wannier90", "run"]
+def _wannier_launcher(run_dir: Path, config: dict[str, Any], directory: Path, mode: str = "run") -> list[str]:
+    """Resolve the Wannier90 launcher from ``preprocess_inputs.commands.04_wannier90``."""
+    commands = config.get("preprocess_inputs", {}).get("commands")
+    if not isinstance(commands, dict):
+        raise ValueError("Stage-1 配置缺少 preprocess_inputs.commands（无法解析 Wannier90 launcher）。")
+    template = commands.get("04_wannier90")
+    if (
+        not isinstance(template, list)
+        or len(template) < 3
+        or any(not isinstance(item, str) for item in template)
+    ):
+        raise ValueError(
+            "preprocess_inputs.commands.04_wannier90 必须是至少 3 项参数列表，末项固定为 wannier90。"
+        )
+    if template[-1] != "wannier90":
+        raise ValueError(
+            "preprocess_inputs.commands.04_wannier90 末项必须是固定逻辑 seed wannier90；"
+            f"当前为 {template[-1]!r}。"
+        )
+    if mode not in {"pre", "run"}:
+        raise ValueError("Wannier90 模式只能是 pre 或 run。")
+    return _expand_command_template(template, directory, run_dir) + [mode]
 
 
 def _required_files(directory: Path, stage: str) -> list[Path]:
@@ -316,9 +382,9 @@ def run_vasp_stage(run_dir: str | Path, stage: str, execute: bool = False, struc
     for sid in selected:
         directory = root / "structures" / sid / stage_dir_name
         missing = [str(path) for path in _required_files(directory, stage) if not path.is_file()]
-        command_chain = [_launcher(root, config, directory)]
+        command_chain = [_launcher(root, config, directory, stage)]
         if stage == "wannier":
-            command_chain.append(_wannier_launcher(directory))
+            command_chain.append(_wannier_launcher(root, config, directory))
         commands.append({"structure": sid, "directory": str(directory), "command_chain": command_chain, "missing_inputs": missing})
     if not execute:
         return {"mode": "DRY_RUN", "stage": stage, "would_run": commands, "passed": not any(item["missing_inputs"] for item in commands)}
@@ -682,6 +748,20 @@ def generate_candidates(run_dir: str | Path) -> dict[str, Any]:
         "structures": analyses,
         **candidate_payload,
     }
+    # Preserve candidates excluded by the dimensional cap as diagnostic evidence.
+    # Do not silently turn a missing complete-shell trial into a fitting failure.
+    for sid, analysis in analyses.items():
+        unrestricted = suggest_projection_candidates(
+            analysis["projection_analysis"]["orbital_scores"],
+            element_counts_by_structure[sid], soc, chemical_valence,
+            shell_family_min_weight=shell_family_min_weight,
+            shell_combination_min_weight=shell_combination_min_weight,
+            max_num_wann=None, max_candidates=None,
+            external_candidates=pyw90_external([sid]),
+        )
+        analysis["candidate_dimension_budget"] = candidate_dimension_budget(
+            unrestricted, int(analysis["eigenval"]["nbands"]), max_model_fraction,
+        )
     output = root / "03_candidates/candidate-spec.json"
     atomic_json(output, payload)
     update_stage(root, "03_candidates", status="PASS", finished_utc=_utc_now(), outputs=[str(output)])
