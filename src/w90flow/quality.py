@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
+from .acceptance import require_audited_sources, strict_quality_passed
 from .parsers import convergence_gate, count_wannier_centres, parse_eigenval, parse_fermi_outcar, parse_hr_header, parse_poscar, parse_wout
 from .paths import matplotlib_cache_dir
 from .state import atomic_json, read_json, sha256_file, update_stage
@@ -727,14 +728,15 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
             results.append({
                 "candidate": raw["candidate"],
                 "attempt": "baseline",
-                "projection": raw["projection"],
-                "num_wann": raw["num_wann"],
+                "projection": raw.get("projection", []),
+                "num_wann": raw.get("num_wann", 0),
                 "nocc_model": raw.get("nocc_model"),
                 "metrics": raw["metrics"],
                 "native_model_metrics": raw["metrics"],
                 "final_total_spread_ang2": raw.get("final_total_spread_ang2"),
                 "mean_spread_per_wf_ang2": None if raw.get("final_total_spread_ang2") is None else raw["final_total_spread_ang2"] / raw["num_wann"],
-                "passed": raw["passed"],
+                "passed": strict_quality_passed(raw),
+                "acceptance_note": None if strict_quality_passed(raw) else "current_convergence_quality_audit_required",
                 "quality": str(baseline),
                 "candidate_family": metadata.get("candidate_family", "legacy_baseline"),
                 "integrated_weight_fraction": metadata.get("integrated_weight_fraction"),
@@ -745,14 +747,15 @@ def rank_attempts(run_dir: str | Path) -> dict[str, Any]:
             results.append({
                 "candidate": raw["candidate"],
                 "attempt": raw["attempt"],
-                "projection": raw["projection"],
-                "num_wann": raw["num_wann"],
+                "projection": raw.get("projection", []),
+                "num_wann": raw.get("num_wann", 0),
                 "nocc_model": raw.get("nocc_model"),
-                "metrics": raw["target_metrics"],
+                "metrics": raw.get("target_metrics", {}),
                 "native_model_metrics": raw.get("native_model_metrics"),
                 "final_total_spread_ang2": raw.get("final_total_spread_ang2"),
                 "mean_spread_per_wf_ang2": raw.get("mean_spread_per_wf_ang2"),
-                "passed": raw["passed"],
+                "passed": strict_quality_passed(raw),
+                "acceptance_note": None if strict_quality_passed(raw) else "current_convergence_quality_audit_required",
                 "quality": str(quality_path),
                 "candidate_family": metadata.get("candidate_family"),
                 "integrated_weight_fraction": metadata.get("integrated_weight_fraction"),
@@ -917,6 +920,16 @@ def export_ranked_attempts(run_dir: str | Path) -> dict[str, Any]:
             raise ValueError("independent 排名没有通过项，不能导出。")
     else:
         raise ValueError(f"未知 ensemble_mode：{ensemble_mode}")
+    # Validate every selected source before creating any output package.
+    for item in export_entries:
+        for sid, member in item["members"].items():
+            quality_path = Path(member["quality"]).resolve()
+            source = quality_path.parent
+            require_audited_sources(read_json(quality_path), {
+                "EIGENVAL": root / "structures" / sid / "02_band/EIGENVAL",
+                "wannier90_hr.dat": source / "wannier90_hr.dat",
+                "wannier90.wout": source / "wannier90.wout",
+            })
     output.mkdir(parents=True, exist_ok=True)
     packages: list[dict[str, Any]] = []
 

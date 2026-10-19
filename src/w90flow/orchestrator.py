@@ -12,6 +12,7 @@ from typing import Any, Mapping
 
 import yaml  # type: ignore[import-untyped]
 
+from .acceptance import strict_quality_passed
 from .attempts import create_attempts, recorded_or_classified_failure, run_attempt
 from .executor import generate_candidates, import_completed_stage, prepare_run, reconcile_stage, run_vasp_stage
 from .parsers import parse_poscar, parse_wout
@@ -570,10 +571,10 @@ def _accepted_coverage(root: Path, config: dict[str, Any], spec: dict[str, Any])
     for sid in structures:
         for quality_path in sorted((root / "structures" / sid / "04_wannier_attempts").glob("*/attempt-*/quality.json")):
             quality = read_json(quality_path)
-            if quality.get("passed"):
+            if strict_quality_passed(quality):
                 accepted[sid].append(f"{quality['candidate']}/{quality['attempt']}")
         baseline = root / "structures" / sid / "05_quality/quality.json"
-        if baseline.is_file() and read_json(baseline).get("passed"):
+        if baseline.is_file() and strict_quality_passed(read_json(baseline)):
             accepted[sid].append("baseline")
     if spec["ensemble_mode"] == "common_basis":
         common = set(accepted[structures[0]]) if structures else set()

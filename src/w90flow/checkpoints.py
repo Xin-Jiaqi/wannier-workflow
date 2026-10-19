@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .acceptance import strict_quality_passed
 from .state import atomic_json, read_json, sha256_file
 
 
@@ -34,6 +35,8 @@ def checkpoint_accepted_candidate(
             raise ValueError(f"{sid}/{candidate}/{attempt} is not quality-accepted")
         if (quality.get("structure"), quality.get("candidate"), quality.get("attempt")) != (sid, candidate, attempt):
             raise ValueError("checkpoint quality identity mismatch")
+        if not strict_quality_passed(quality):
+            raise ValueError("checkpoint requires current convergence/quality audit")
         checks = quality.get("checks")
         if not isinstance(checks, dict) or not checks or any(value is not True for value in checks.values()):
             raise ValueError("checkpoint requires all recorded quality checks to pass")

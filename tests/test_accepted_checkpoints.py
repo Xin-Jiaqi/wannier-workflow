@@ -22,7 +22,7 @@ def accepted(root: Path, sid: str = "sheet", candidate: str = "first") -> Path:
     band.parent.mkdir(exist_ok=True)
     band.write_text("synthetic independent DFT path")
     quality = {"passed": True, "structure": sid, "candidate": candidate, "attempt": "attempt-001",
-               "checks": {"w90_completed": True, "hr_centres_match": True, "rmse": True,
+               "checks": {"w90_converged": True, "w90_completed": True, "hr_centres_match": True, "rmse": True,
                           "p95": True, "max": True, "gap": True},
                "source_sha256": {"EIGENVAL": sha256_file(band),
                                  **{n: sha256_file(source / n) for n in ["wannier90_hr.dat", "wannier90.wout"]}}}

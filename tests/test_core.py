@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from w90flow.config import load_project
+from w90flow.state import sha256_file
 from w90flow.attempts import build_standalone_w90_input, canonicalize_standalone_w90_kpoints, classify_failure, import_completed_attempt, materialize_plan_energy_reference, plan_candidate, reconcile_mmn_neighbour_cells, recorded_or_classified_failure
 from w90flow.candidates import normalize_projection, num_wann_from_projection, suggest_projection_candidates
 from w90flow.dataset import make_attempt_record
@@ -715,6 +716,16 @@ class RankingTests(unittest.TestCase):
                 "physics:\n  soc: true\n  dimensionality: 2\n  axes: [x, y, z]\n",
                 encoding="utf-8",
             )
+            reference = root / "structures/SnS2/02_band/EIGENVAL"
+            reference.parent.mkdir(parents=True)
+            reference.write_text("synthetic DFT reference")
+            (source / "wannier90.wout").write_text("Wannierisation convergence criteria satisfied\nAll done\n")
+            quality = {"passed": True, "checks": {name: True for name in (
+                "w90_completed", "w90_converged", "hr_centres_match", "rmse", "p95", "max", "gap")},
+                "source_sha256": {"EIGENVAL": sha256_file(reference),
+                                  **{name: sha256_file(source / name) for name in (
+                                      "wannier90_hr.dat", "wannier90.wout")}}}
+            (source / "quality.json").write_text(json.dumps(quality))
             result = export_ranked_attempts(root)
             package = Path(result["packages"][0]["path"])
             self.assertTrue((package / "SnS2/wannier90-wcenter.dat").is_file())
