@@ -371,7 +371,7 @@ def check_platform_paths(config: dict[str, Any], config_text: str, platform: str
         for line in text_hits[:5]:
             items.append(_item("platform.mac_path.config", "配置内 Mac 路径", "FAIL", line))
         if not mac_hits and not text_hits:
-            items.append(_item("platform.mac_path", "绝对 Mac 路径", "PASS", "未发现 /Users/ /Volumes/ Desktop"))
+            items.append(_item("platform.mac_path", "绝对 Mac 路径", "PASS", "未发现 Mac 用户、外盘或桌面绝对路径"))
     else:
         cluster_hits = []
         for token in tokens:

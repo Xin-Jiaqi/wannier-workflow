@@ -662,10 +662,10 @@ def reconcile_mmn_neighbour_cells(
                 raise ValueError("WIN/IBZKPT k 点不是相同索引的整倒格矢平移。")
             shifts.append(tuple(round(value) for value in delta))
         translated = []
-        for first, second, *cell in headers:
+        for first, second, *cell_components in headers:
             if not (1 <= first <= num_kpoints and 1 <= second <= num_kpoints):
                 raise ValueError("MMN 邻居 k 点索引越界。")
-            mapped = tuple(cell[axis] + shifts[second - 1][axis] - shifts[first - 1][axis]
+            mapped = tuple(cell_components[axis] + shifts[second - 1][axis] - shifts[first - 1][axis]
                            for axis in range(3))
             translated.append((first, second, *mapped))
         if Counter(translated) == expected_counter:

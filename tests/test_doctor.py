@@ -246,7 +246,7 @@ class DoctorEnvironmentTests(unittest.TestCase):
     def test_absolute_mac_path_fails_on_linux_but_command_filename_allowed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config = _fixture(root, mac_command="/Users/jiaqi/bin/run-vasp")
+            config = _fixture(root, mac_command=str(Path("/").joinpath("Users", "example", "bin", "run-vasp")))
             report = self._run(config, temporary, platform="linux")
             self.assertEqual(_status(report, "platform.mac_path"), "FAIL")
             self.assertEqual(report["overall"], "FAIL")
