@@ -60,6 +60,7 @@ class StrictAcceptance(unittest.TestCase):
             result = evaluate_attempt(root, 'X', 'p', 'attempt-001')
             self.assertFalse(result['passed'])
             self.assertEqual(result['failure_class'], 'DISENTANGLEMENT_NOT_CONVERGED')
+            self.assertEqual(json.loads((attempt / 'attempt.json').read_text())['status'], 'REJECTED_QUALITY')
 
     def test_reuse_rejects_unconverged_source_before_copying_outputs(self):
         with tempfile.TemporaryDirectory() as temporary:

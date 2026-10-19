@@ -400,6 +400,10 @@ def evaluate_attempt(
                     "attempt": attempt, "passed": False, "failure_class": failure,
                     "convergence_check": convergence, "checks": {"w90_converged": False}}
         atomic_json(directory / "quality.json", rejected)
+        record.update({"status": "REJECTED_QUALITY", "failure_class": failure,
+                       "quality": str(directory / "quality.json"),
+                       "quality_evaluated_utc": datetime.now(timezone.utc).isoformat()})
+        atomic_json(record_path, record)
         return rejected
     base = root / "structures" / structure
     band_dir = base / "02_band"
