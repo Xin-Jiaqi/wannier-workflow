@@ -157,7 +157,8 @@ class DoctorEnvironmentTests(unittest.TestCase):
                                                       "qstat": "/opt/pbs/bin/qstat"}.get(name)):
                 work = Path(temporary) / "work"
                 work.mkdir()
-                report = self._run(config, str(work), platform="linux")
+                report = self._run(config, str(work), platform="linux",
+                                   import_probe=lambda name: ("OK", "synthetic-1.0"))
             self.assertEqual(report["overall"], "PASS", report)
             self.assertEqual(_status(report, "commands.present"), "PASS")
             self.assertEqual(_status(report, "cmd.04_wannier90"), "PASS")
@@ -312,7 +313,10 @@ class DoctorEnvironmentTests(unittest.TestCase):
             config = _fixture(root)
             good = types.SimpleNamespace(config=str(config), work_root=temporary, json=True)
             buffer = io.StringIO()
-            with redirect_stdout(buffer):
+            with redirect_stdout(buffer), mock.patch("w90flow.doctor.shutil.which",
+                    side_effect=lambda name: {"mpirun": "/bin/true",
+                                              "qsub": "/opt/pbs/bin/qsub",
+                                              "qstat": "/opt/pbs/bin/qstat"}.get(name)):
                 exit_code = doctor_cli(good)
             payload = json.loads(buffer.getvalue())
             self.assertEqual(exit_code, 0)
@@ -332,6 +336,13 @@ class DoctorEnvironmentTests(unittest.TestCase):
             config = _fixture(root)
             env = dict(os.environ)
             env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            for name in ("qsub", "qstat", "mpirun"):
+                command = fake_bin / name
+                command.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                command.chmod(0o755)
+            env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
             completed = subprocess.run(
                 [sys.executable, "-m", "w90flow", "doctor",
                  "--config", str(config), "--work-root", temporary, "--json"],
@@ -339,7 +350,8 @@ class DoctorEnvironmentTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             payload = json.loads(completed.stdout)
-            self.assertEqual(payload["overall"], "WARN")  # darwin 无 PBS → WARN
+            self.assertIn(payload["overall"], {"PASS", "WARN"})
+            self.assertEqual(_status(payload, "pbs"), "PASS")
 
 
 if __name__ == "__main__":
